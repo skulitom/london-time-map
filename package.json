@@ -1,0 +1,15 @@
+{
+  "name": "london-time-map",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A dark-mode map of London that stretches and shrinks by travel time.",
+  "type": "module",
+  "scripts": {
+    "build:data": "node scripts/build-data.mjs",
+    "serve": "python -m http.server 8000"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
