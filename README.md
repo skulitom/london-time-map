@@ -1,5 +1,7 @@
 # London in minutes
 
+**Live map: <https://skulitom.github.io/london-time-map/>**
+
 A dark-mode map of London coloured by **travel time**. Pick a starting point (a station, a landmark,
 a postcode, or any click on the map) and every part of the city is shaded from green (close) to red
 (far). Tick boxes choose how you are willing to travel, and the colours update:
@@ -84,3 +86,8 @@ minutes.
 Contains OS data © Crown copyright and database right; ONS boundaries are licensed under the
 Open Government Licence v3. Map data © OpenStreetMap contributors, ODbL. Transport data powered by
 TfL Open Data.
+
+## License
+
+The code is released under the [MIT License](LICENSE). The generated files in `data/` remain
+subject to the terms of their sources listed above.
