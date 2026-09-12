@@ -11,6 +11,7 @@ import { GROUP_OF_MODE, PLATFORM_ACCESS, PLATFORM_EXIT, WALK, CENTRE, walkStepMi
 
 const KX = 111320 * Math.cos((51.5 * Math.PI) / 180);
 const KY = 110574;
+export const METRES_PER_DEG = { x: KX, y: KY };
 export const toMetres = (lon, lat) => [(lon - CENTRE.lon) * KX, (lat - CENTRE.lat) * KY];
 
 export const LEG = { WALK: 1, BOARD: 2, ALIGHT: 3, RIDE: 4 };

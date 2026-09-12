@@ -1,10 +1,10 @@
 // Application controller: loads data, runs the routing engine, builds the colour bands, wires the UI.
 
-import { Engine, toMetres } from './engine.js';
+import { Engine, toMetres, METRES_PER_DEG } from './engine.js';
 import { WalkGrid } from './walkgrid.js';
 import { Warp } from './warp.js';
 import { Renderer, COLOURS, blend } from './render.js';
-import { MODES, BANDS, BAND_THRESHOLDS, UNREACHABLE_COLOUR, carMinutes } from './model.js';
+import { MODES, BANDS, BAND_THRESHOLDS, UNREACHABLE_COLOUR, CENTRE, carMinutes, carFloorMinutes, CAR_MINUTES_PER_METRE, CAR } from './model.js';
 
 const DEFAULT_ORIGIN = { lat: 51.508, lon: -0.1281, name: 'Trafalgar Square', node: -1 };
 const BASE_SIZE = 1000;
@@ -103,12 +103,10 @@ async function main() {
   const nodeCell = Int32Array.from(nodes, (n) => (n.kind === 'station' ? engine.stopCell[n.stop] : grid.nearestWalkable(grid.cellOf(n.lon, n.lat))));
   const nodeMx = new Float64Array(N);
   const nodeMy = new Float64Array(N);
-  const nodeRc = new Float64Array(N);
   nodes.forEach((n, i) => {
     const [x, y] = toMetres(n.lon, n.lat);
     nodeMx[i] = x;
     nodeMy[i] = y;
-    nodeRc[i] = Math.hypot(x, y);
   });
   const nearestNodeTo = (lat, lon, maxMetres) => {
     const [x, y] = toMetres(lon, lat);
@@ -209,6 +207,31 @@ async function main() {
   const warp = new Warp(cpX, cpY);
   const binding = warp.bind(mesh.base);
 
+  // Grid cells project cheaply: Mercator is affine in longitude, and latitude only depends on the
+  // row, so one multiply plus a row table replaces a projection call per vertex. Worth it because
+  // the colour bands re-project tens of thousands of contour vertices on every recalculation.
+  const [gridLon0, gridLat0] = grid.lonLatOfGrid(0, 0);
+  const [gridLon1, gridLat1] = grid.lonLatOfGrid(1, 1);
+  const gridDLon = gridLon1 - gridLon0;
+  const gridDLat = gridLat1 - gridLat0;
+  const gridX0 = proj(gridLon0, gridLat0)[0];
+  const gridDX = proj(gridLon0 + gridDLon, gridLat0)[0] - gridX0;
+  const gridYAt = new Float64Array(grid.rows + 2);
+  for (let j = 0; j < gridYAt.length; j++) gridYAt[j] = proj(gridLon0, gridLat0 + j * gridDLat)[1];
+  const gridProjY = (gy) => {
+    const j = Math.max(0, Math.min(gridYAt.length - 2, Math.floor(gy)));
+    return gridYAt[j] + (gy - j) * (gridYAt[j + 1] - gridYAt[j]);
+  };
+  (() => { // the fast projector must agree with the real one
+    let worst = 0;
+    for (const [gx, gy] of [[0.5, 0.5], [17.3, 91.7], [grid.cols - 0.5, grid.rows - 0.5], [200.25, 160.75]]) {
+      const [lon, lat] = grid.lonLatOfGrid(gx, gy);
+      const [ex, ey] = proj(lon, lat);
+      worst = Math.max(worst, Math.abs(ex - (gridX0 + gx * gridDX)), Math.abs(ey - gridProjY(gy)));
+    }
+    if (worst > 0.01) console.warn(`fast grid projection off by ${worst.toFixed(4)} base units`);
+  })();
+
   // ---------------------------------------------------------------- computation
   let originBase = proj(state.origin.lon, state.origin.lat);
   let originCell = -1;
@@ -217,17 +240,28 @@ async function main() {
   let nodeByCar = null;
   let surface = null;      // minutes to each grid cell
   let bandsGeom = null;
+  let coverage = { londonCells: 0, within45: 0 };
   let lastTiming = {};
+
+  // Version counters. The renderer caches the map layer and its geometry paths, and re-renders only
+  // when one of these changes.
+  let geomVersion = 0;   // warped geometry moved
+  let bandsVersion = 0;  // colour bands rebuilt
+  let dataVersion = 0;   // times, routing result
+  let styleVersion = 0;  // toggles that change how things are drawn
 
   function compute() {
     const anyMode = MODES.some((m) => state.enabled[m.id]);
     originCell = grid.nearestWalkable(grid.cellOf(state.origin.lon, state.origin.lat));
+    dataVersion++;
     if (!anyMode || originCell < 0) {
       lastResult = null;
       times = null;
       nodeByCar = null;
       surface = null;
       bandsGeom = null;
+      bandsVersion++;
+      coverage = { londonCells: 0, within45: 0 };
       return;
     }
     const t0 = performance.now();
@@ -236,22 +270,45 @@ async function main() {
     const dist = lastResult.dist;
     const [ox, oy] = toMetres(state.origin.lon, state.origin.lat);
 
-    surface = new Float32Array(C);
-    for (let c = 0; c < C; c++) surface[c] = dist[c];
-    times = new Float64Array(N);
-    nodeByCar = new Uint8Array(N);
-    if (state.enabled.car) {
-      for (let c = 0; c < C; c++) {
-        const [lon, lat] = grid.centre(c);
-        const [x, y] = toMetres(lon, lat);
-        const t = carMinutes(ox, oy, x, y);
-        if (t < surface[c]) surface[c] = t;
+    // One pass over the grid: copy the walking/transit times, fold in driving where it is quicker,
+    // and count how much of Greater London falls inside 45 minutes.
+    if (!surface || surface.length !== C) surface = new Float32Array(C);
+    const car = state.enabled.car;
+    const { cols, rows, mask, london } = grid;
+    const stepX = gridDLon * METRES_PER_DEG.x;
+    let londonCells = 0;
+    let within45 = 0;
+    for (let j = 0, c = 0; j < rows; j++) {
+      const my = (gridLat0 + (j + 0.5) * gridDLat - CENTRE.lat) * METRES_PER_DEG.y;
+      let mx = (gridLon0 + 0.5 * gridDLon - CENTRE.lon) * METRES_PER_DEG.x;
+      for (let i = 0; i < cols; i++, c++, mx += stepX) {
+        let t = dist[c];
+        // Driving is only worked out where it could actually win: the cheapest conceivable drive is
+        // the fixed overhead plus the straight line at top speed.
+        if (car && t > CAR.overhead) {
+          const dx = mx - ox;
+          const dy = my - oy;
+          if (t > CAR.overhead + Math.sqrt(dx * dx + dy * dy) * CAR_MINUTES_PER_METRE) {
+            const tc = carMinutes(ox, oy, mx, my);
+            if (tc < t) t = tc;
+          }
+        }
+        surface[c] = t;
+        if (london[c] && mask[c]) {
+          londonCells++;
+          if (t <= 45) within45++;
+        }
       }
     }
+    coverage = { londonCells, within45 };
+
+    if (!times || times.length !== N) times = new Float64Array(N);
+    if (!nodeByCar) nodeByCar = new Uint8Array(N);
+    nodeByCar.fill(0);
     for (let i = 0; i < N; i++) {
       const c = nodeCell[i];
       let t = c >= 0 ? dist[c] : Infinity;
-      if (state.enabled.car) {
+      if (car && t > carFloorMinutes(Math.hypot(nodeMx[i] - ox, nodeMy[i] - oy))) {
         const tc = carMinutes(ox, oy, nodeMx[i], nodeMy[i]);
         if (tc < t) {
           t = tc;
@@ -262,36 +319,37 @@ async function main() {
     }
     const t2 = performance.now();
     bandsGeom = buildBands(surface);
+    bandsVersion++;
     lastTiming = { routeMs: t1 - t0, surfaceMs: t2 - t1, bandsMs: performance.now() - t2 };
   }
 
   // Filled contour bands of the travel-time surface, in base coordinates.
+  const bandValues = new Float64Array(C);
   function buildBands(surf) {
-    const values = new Float64Array(C);
-    for (let c = 0; c < C; c++) values[c] = Number.isFinite(surf[c]) ? surf[c] : 1e9;
-    const thresholds = [...BAND_THRESHOLDS, 1e8];
-    const contours = d3.contours().size([grid.cols, grid.rows]).thresholds(thresholds)(values);
-    const coords = [];
+    for (let c = 0; c < C; c++) bandValues[c] = Number.isFinite(surf[c]) ? surf[c] : 1e9;
+    const contours = d3.contours().size([grid.cols, grid.rows]).thresholds([...BAND_THRESHOLDS, 1e8])(bandValues);
+    let total = 0;
+    for (const contour of contours) for (const polygon of contour.coordinates) for (const ring of polygon) total += ring.length;
+    const baseCoords = new Float64Array(total * 2);
     const list = [];
+    let at = 0;
     contours.forEach((contour, k) => {
-      const colour = k < BANDS.length ? BANDS[k].colour : UNREACHABLE_COLOUR;
       const polygons = [];
       for (const polygon of contour.coordinates) {
         const rings = [];
         for (const ring of polygon) {
-          const start = coords.length / 2;
-          for (const [gx, gy] of ring) {
-            const [lon, lat] = grid.lonLatOfGrid(gx, gy);
-            const [x, y] = proj(lon, lat);
-            coords.push(x, y);
+          const start = at;
+          for (let v = 0; v < ring.length; v++) {
+            baseCoords[2 * at] = gridX0 + ring[v][0] * gridDX;
+            baseCoords[2 * at + 1] = gridProjY(ring[v][1]);
+            at++;
           }
           rings.push([start, ring.length]);
         }
         polygons.push(rings);
       }
-      list.push({ colour, polygons });
+      list.push({ colour: k < BANDS.length ? BANDS[k].colour : UNREACHABLE_COLOUR, polygons });
     });
-    const baseCoords = Float64Array.from(coords);
     return { base: baseCoords, coords: baseCoords, list, binding: null, warped: null };
   }
 
@@ -377,16 +435,18 @@ async function main() {
         bandsGeom.coords = bandsGeom.warped;
       } else bandsGeom.coords = bandsGeom.base;
     }
+    geomVersion++;
   }
 
   function draw() {
-    renderer.draw({
+    return renderer.draw({
       transform, layers, mesh, lines: transit.lines, enabled: state.enabled,
       bands: bandsGeom, busSegments, showBus: state.showBus && state.morph === 0 && !anim,
       nodes, nodeX: cur.tx, nodeY: cur.ty, times,
       origin: { x: originBase[0], y: originBase[1], name: state.origin.name, node: state.origin.node },
       ringScale: cur.ringScale, morph: state.morph,
       hover: state.hover, route, ghost: state.ghost && state.morph > 0, showStations: state.showStations,
+      geomVersion, bandsVersion, dataVersion, styleVersion,
     });
   }
 
@@ -410,15 +470,9 @@ async function main() {
       applyWarp();
     }
     draw();
+    // Frames are only requested while the stretch animation is running. Otherwise the page goes
+    // completely idle: no timers, no repaints.
     if (anim) requestFrame();
-    else pulseLoop();
-  }
-
-  // Gentle idle redraw for the pulsing origin marker.
-  let pulseTimer = null;
-  function pulseLoop() {
-    clearTimeout(pulseTimer);
-    pulseTimer = setTimeout(() => { if (!anim && document.visibilityState === 'visible') requestFrame(); }, 90);
   }
 
   function transitionTo(target) {
@@ -487,22 +541,16 @@ async function main() {
 
   // ---------------------------------------------------------------- recompute
   const statsEl = $('stats');
-  let computing = false;
-  let pending = false;
 
-  async function recompute() {
-    if (computing) {
-      pending = true;
-      return;
-    }
-    computing = true;
-    statsEl.innerHTML = 'Calculating…';
-    await new Promise((r) => setTimeout(r, 0));
+  // Runs start to finish in one task, so a click always lands on a fully drawn map. The whole
+  // recalculation is around a tenth of a second, short enough not to need progress reporting.
+  function recompute() {
     compute();
     full = computeFull();
     const target = withMorph(full);
     updateRoute();
     updateStats();
+    invalidateTooltip();
     writeHash();
     if (state.morph > 0) {
       transitionTo(target);
@@ -512,12 +560,7 @@ async function main() {
       anim = null;
       applyWarp();
       if (autoFit) selection.call(zoom.transform, fitTransform(boundsOf(target)));
-      requestFrame();
-    }
-    computing = false;
-    if (pending) {
-      pending = false;
-      recompute();
+      draw();
     }
   }
 
@@ -529,7 +572,7 @@ async function main() {
     applyWarp();
     writeHash();
     if (autoFit) selection.call(zoom.transform, fitTransform(boundsOf(target)));
-    requestFrame();
+    draw();
   }
 
   function updateStats() {
@@ -539,14 +582,7 @@ async function main() {
     }
     const finite = Array.from(times).filter(Number.isFinite).sort((a, b) => a - b);
     const median = finite.length ? finite[Math.floor(finite.length / 2)] : NaN;
-    let londonCells = 0;
-    let within45 = 0;
-    for (let c = 0; c < C; c++) {
-      if (!grid.london[c] || !grid.mask[c]) continue;
-      londonCells++;
-      if (surface[c] <= 45) within45++;
-    }
-    const share = londonCells ? Math.round((100 * within45) / londonCells) : 0;
+    const share = coverage.londonCells ? Math.round((100 * coverage.within45) / coverage.londonCells) : 0;
     const unreachable = N - finite.length;
     statsEl.innerHTML = `Median place <b>${formatMinutes(median)}</b> away · <b>${share}%</b> of London within 45 min`
       + (unreachable ? ` · <b>${unreachable}</b> of ${N} places out of reach` : '');
@@ -596,7 +632,11 @@ async function main() {
   }
 
   const tooltip = $('tooltip');
-  function showTooltip(i, sx, sy) {
+  let tipFor = -2;
+  let tipSize = { w: 0, h: 0 };
+
+  // Rebuilding the tooltip markup forces a layout, so it only happens when the place changes.
+  function fillTooltip(i) {
     const node = nodes[i];
     const modes = node.kind === 'station' ? [...node.lineIds].map((l) => transit.lines[l].name).join(', ') : 'Place';
     let html = `<div class="name">${node.name}</div><div class="kind">${modes}</div>`;
@@ -617,34 +657,67 @@ async function main() {
     }
     tooltip.innerHTML = html;
     tooltip.hidden = false;
-    const W = window.innerWidth;
-    const H = window.innerHeight;
     const rect = tooltip.getBoundingClientRect();
-    let x = sx + 16;
-    let y = sy + 16;
-    if (x + rect.width > W - 8) x = sx - rect.width - 12;
-    if (y + rect.height > H - 8) y = sy - rect.height - 12;
-    tooltip.style.left = `${x}px`;
-    tooltip.style.top = `${y}px`;
+    tipSize = { w: rect.width, h: rect.height };
   }
 
-  canvas.addEventListener('mousemove', (ev) => {
-    const i = nearestNode(ev.clientX, ev.clientY, 12);
+  function placeTooltip(sx, sy) {
+    let x = sx + 16;
+    let y = sy + 16;
+    if (x + tipSize.w > window.innerWidth - 8) x = sx - tipSize.w - 12;
+    if (y + tipSize.h > window.innerHeight - 8) y = sy - tipSize.h - 12;
+    tooltip.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+  }
+
+  // Pointer moves arrive far faster than frames, so the hit test runs at most once per frame.
+  let pointerX = 0;
+  let pointerY = 0;
+  let pointerQueued = false;
+
+  function handlePointer() {
+    pointerQueued = false;
+    const i = nearestNode(pointerX, pointerY, 12);
     if (i !== state.hover) {
       state.hover = i;
       updateRoute();
       requestFrame();
     }
-    if (i >= 0) showTooltip(i, ev.clientX, ev.clientY);
-    else tooltip.hidden = true;
+    if (i >= 0) {
+      if (i !== tipFor) {
+        fillTooltip(i);
+        tipFor = i;
+      }
+      placeTooltip(pointerX, pointerY);
+    } else if (tipFor !== -1) {
+      tooltip.hidden = true;
+      tipFor = -1;
+    }
     canvas.style.cursor = i >= 0 ? 'pointer' : 'crosshair';
+  }
+
+  canvas.addEventListener('mousemove', (ev) => {
+    pointerX = ev.clientX;
+    pointerY = ev.clientY;
+    if (pointerQueued) return;
+    pointerQueued = true;
+    requestAnimationFrame(handlePointer);
   });
   canvas.addEventListener('mouseleave', () => {
     state.hover = -1;
     updateRoute();
     tooltip.hidden = true;
+    tipFor = -1;
     requestFrame();
   });
+  // The hovered place is drawn into the cached layer, so its tooltip must be refreshed too.
+  function invalidateTooltip() {
+    tipFor = -2;
+    if (state.hover >= 0) {
+      fillTooltip(state.hover);
+      tipFor = state.hover;
+      placeTooltip(pointerX, pointerY);
+    }
+  }
 
   // A start point within a few metres of a known place takes that place's identity and name.
   function snapOrigin(origin) {
@@ -712,9 +785,14 @@ async function main() {
   });
   if (state.morph > 0) $('more').open = true;
 
-  $('ghost').addEventListener('change', (ev) => { state.ghost = ev.target.checked; requestFrame(); });
-  $('stations').addEventListener('change', (ev) => { state.showStations = ev.target.checked; requestFrame(); });
-  $('busnet').addEventListener('change', (ev) => { state.showBus = ev.target.checked; requestFrame(); });
+  const setFlag = (key, value) => {
+    state[key] = value;
+    styleVersion++;
+    draw();
+  };
+  $('ghost').addEventListener('change', (ev) => setFlag('ghost', ev.target.checked));
+  $('stations').addEventListener('change', (ev) => setFlag('showStations', ev.target.checked));
+  $('busnet').addEventListener('change', (ev) => setFlag('showBus', ev.target.checked));
   $('collapse').addEventListener('click', () => {
     const panel = $('panel');
     panel.classList.toggle('collapsed');
@@ -780,12 +858,16 @@ async function main() {
     get transform() { return transform; },
     get cur() { return cur; },
     get timing() { return lastTiming; },
+    get renderStats() { return renderer.stats; },
     screenOf(i) { return [cur.tx[i] * transform.k + transform.x, cur.ty[i] * transform.k + transform.y]; },
+    gridProject(gx, gy) { return [gridX0 + gx * gridDX, gridProjY(gy)]; },
     journeyTo,
-    timeFrame() {
+    timeFrame({ relayout = false, rebuildPaths = false } = {}) {
+      if (rebuildPaths) renderer.pathKey = null;
+      if (relayout) renderer.frameKey = null;
       const t0 = performance.now();
-      draw();
-      return { drawMs: performance.now() - t0 };
+      const painted = draw();
+      return { ms: performance.now() - t0, painted, pathMs: renderer.stats.pathMs };
     },
   };
 

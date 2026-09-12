@@ -223,6 +223,9 @@ input[type="range"] {
 
 .tooltip {
   position: fixed;
+  left: 0;
+  top: 0;
+  will-change: transform;
   z-index: 6;
   pointer-events: none;
   max-width: 280px;

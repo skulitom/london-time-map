@@ -79,14 +79,18 @@ export function hopMinutes(mode, metres, rCentre) {
 // Car: fetch the car and park it (6 min), and drive at daytime speeds that ease off outside the centre.
 // Speed is integrated along the straight line between the two points (in metres from Charing Cross),
 // so a trip through the middle is slow in the middle and quicker on the way out.
-export const CAR = { overhead: 6, detour: 1.25, samples: 8 };
+export const CAR = { overhead: 6, detour: 1.25, samples: 8, topSpeedKmh: 60 };
 export function carSpeedKmh(rCentre) {
   const km = rCentre / 1000;
   if (km < 3) return 16;
   if (km < 8) return 16 + ((km - 3) / 5) * 14;
   if (km < 16) return 30 + ((km - 8) / 8) * 15;
-  return Math.min(60, 45 + ((km - 16) / 8) * 15);
+  return Math.min(CAR.topSpeedKmh, 45 + ((km - 16) / 8) * 15);
 }
+// The quickest a drive could possibly be: overhead plus the whole way at the top speed. Lets the
+// caller skip the integral below for places that some other mode already reaches sooner.
+export const CAR_MINUTES_PER_METRE = CAR.detour / ((CAR.topSpeedKmh * 1000) / 60);
+export const carFloorMinutes = (d) => CAR.overhead + d * CAR_MINUTES_PER_METRE;
 export function carMinutes(ox, oy, x, y) {
   const d = Math.hypot(x - ox, y - oy);
   if (d < 40) return 0;

@@ -26,10 +26,11 @@ the free [postcodes.io](https://postcodes.io) API.
 Any static file server works (ES modules need `http://`, not `file://`):
 
 ```bash
-python -m http.server 8000
+node scripts/dev-server.mjs 8000
 ```
 
-then open <http://localhost:8000>.
+then open <http://localhost:8000>. That server sends `no-store`, so edits always show up on reload;
+`python -m http.server 8000` serves the site just as well if you would rather not use Node.
 
 ## Deploy to GitHub Pages
 
@@ -63,6 +64,26 @@ zoom). Each time the start point or the tick boxes change:
 The travel-time model is deliberately simple and documented in `src/model.js`: typical waits per
 mode, dwell time plus cruising speed per hop for rail and bus, and walking and driving speeds. It is
 meant to show the *shape* of London in time, not to replace a journey planner.
+
+### Keeping it smooth
+
+The map holds a lot of geometry: 33 borough outlines, the Thames and 345 other water bodies, 65
+parks, 787 trunk and motorway runs, 34 rail lines, about 25,000 bus links and 916 labelled places.
+Three rules keep that cheap to interact with:
+
+- **Nothing is drawn twice.** Every input to the picture goes into one key; if the key matches the
+  last frame, `draw()` returns without touching the canvas. An idle map runs no timers and repaints
+  nothing.
+- **Paths are built once.** Geometry lives in `Path2D` objects in base coordinates and is re-used
+  under the canvas transform, so panning and zooming re-rasterise but never rebuild a path. A full
+  repaint is under a millisecond; hovering a place, which also draws its route, is a millisecond or two.
+- **Recalculation happens in one task.** Changing the start point or a tick box runs the search, the
+  surface and the contours start to finish and then paints, so the map is never left half-drawn, not
+  even in a window that is hidden or behind another one and therefore gets no animation frames.
+
+Driving times are only integrated where a car could actually win: the cheapest conceivable drive is
+the fixed overhead plus the straight line at top speed, and any place already reached sooner by
+another mode skips the integral. That is an exact shortcut, not an approximation.
 
 ## Data
 
