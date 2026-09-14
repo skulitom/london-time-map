@@ -82,6 +82,8 @@ graphics card. These rules keep it cheap:
   into an offscreen canvas that covers the window plus a margin. Panning copies it, moved by whole
   pixels, and hovering redraws only the route, stations, places and labels on top of it. Zooming
   scales the copy, and the layer is rendered sharp again once the zoom has been still for 150 ms.
+  Everything drawn over the colour bands is kept in a transparent overlay as well, so a new start
+  point or tick box repaints only the land and the bands beneath it.
 - **Paths stay small.** Chrome rasterises a stroked path that spans the screen many times more slowly
   than the same lines cut into pieces a hundred or so pixels across, so the bus network and the roads
   are drawn in chunks sized to the zoom level and chunks out of view are skipped. National Rail
