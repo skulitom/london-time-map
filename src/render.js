@@ -9,7 +9,8 @@
 //     an offscreen layer covering the window plus a margin, and frames copy it. Panning moves the copy
 //     by whole device pixels, and hovering redraws only what sits on top of it: the route, stations,
 //     places and labels. While zooming the copy is scaled, and once the zoom has been still for a
-//     moment the layer is rendered sharp at the new scale.
+//     moment the layer is rendered sharp at the new scale. Everything above the colour bands is also
+//     kept in a transparent overlay, so new travel times repaint only the bands.
 //   - Chrome rasterises a stroked path whose bounds span the screen far more slowly than the same
 //     lines cut into pieces a hundred or so pixels across. So the bus network and the roads are drawn
 //     in chunks sized to the zoom level, National Rail dashes are laid out here rather than by the
@@ -48,7 +49,7 @@ const MODE_WIDTH = { tube: 2.4, dlr: 2, 'elizabeth-line': 2.4, overground: 2, tr
 const CHUNK_PX = 128;           // target size of a chunk of lines, in device pixels
 const NODE_CELL_PX = 128;       // station and place markers are batched per cell of this many pixels
 const SETTLE_MS = 150;          // a scaled layer is rendered sharp once the zoom has been still this long
-const LAYER_WINDOWS = 2.5;      // the map layer covers at most this many windows' worth of pixels...
+const LAYER_WINDOWS = 2;        // the map layer (and its overlay) covers at most this many windows' worth of pixels...
 const LAYER_MAX_PIXELS = 16e6;  // ...and never more than iOS Safari allows one canvas
 
 function hexToRgb(hex) {
@@ -225,6 +226,10 @@ export class Renderer {
     this.layer.width = 1;
     this.layer.height = 1;
     this.layerCtx = this.layer.getContext('2d', { alpha: false });
+    this.overlay = document.createElement('canvas');
+    this.overlay.width = 1;
+    this.overlay.height = 1;
+    this.overlayCtx = this.overlay.getContext('2d');
     this.held = null; // what the layer holds, and for which transform
     this.onSettle = onSettle;
     this.settleTimer = 0;
@@ -246,7 +251,7 @@ export class Renderer {
     this.nodeStyles = new Map();
     this.textWidths = new Map();
     this.tintCache = new Map();
-    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, draws: 0, layerDraws: 0, skipped: 0 };
+    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, draws: 0, layerDraws: 0, skipped: 0 };
   }
 
   // Setting a canvas's size clears it, even to the same size, so that only happens on a real change.
@@ -432,11 +437,19 @@ export class Renderer {
 
   // ---------------------------------------------------------------- map layer
 
-  // Everything the map layer depends on apart from the transform. Stations and places are drawn on
-  // top of the layer, so showing or hiding them leaves it alone.
-  layerKey(scene) {
+  // What the two parts of the map layer depend on, apart from the transform. The land and the colour
+  // bands change whenever the times do. The rest of the map, drawn over them, changes only with the
+  // geometry, the options that style it and the rail modes that dim lines, so it is kept in a
+  // transparent overlay of its own and new times repaint just the bands beneath it: in software
+  // rendering that is a fifth of the work of the whole layer. Stations and places are drawn on top
+  // of the layer, so showing or hiding them leaves it alone.
+  bandsKey(scene) {
+    return [scene.geomVersion, scene.bandsVersion, scene.warped, this.dpr].join('|');
+  }
+
+  overlayKey(scene) {
     return [
-      scene.geomVersion, scene.bandsVersion, scene.warped, scene.showBus, scene.ghost,
+      scene.geomVersion, scene.warped, scene.showBus, scene.ghost, !!scene.bands,
       !!scene.enabled.underground, !!scene.enabled.trains, this.dpr,
     ].join('|');
   }
@@ -446,37 +459,16 @@ export class Renderer {
   placeLayer(scene, now) {
     const { ctx, dpr } = this;
     const { k, x, y } = scene.transform;
-    const key = this.layerKey(scene);
+    const bandsKey = this.bandsKey(scene);
+    const overlayKey = this.overlayKey(scene);
     let held = this.held;
-    let place = null;
-    if (held && held.key === key) {
-      if (held.k === k) {
-        // Same scale: move the layer, by whole device pixels.
-        const left = Math.round((held.left + x - held.x) * dpr) / dpr;
-        const top = Math.round((held.top + y - held.y) * dpr) / dpr;
-        const candidate = { scale: 1, left, top, k, x: left - held.left + held.x, y: top - held.top + held.y };
-        if (this.covers(held, candidate, 0)) {
-          place = candidate;
-          // A view that has drifted near the layer's edge gets a fresh layer once it is still.
-          if (!this.covers(held, candidate, held.margin / 2)) {
-            if (now - this.movedAt >= SETTLE_MS) place = null;
-            else this.settleSoon();
-          }
-        }
-      } else if (now - this.zoomedAt < SETTLE_MS) {
-        // Zooming: scale the layer for now, and render it sharp once the zoom rests.
-        const scale = k / held.k;
-        const candidate = { scale, left: (held.left - held.x) * scale + x, top: (held.top - held.y) * scale + y, k, x, y };
-        if (scale >= 0.5 && scale <= 2 && this.covers(held, candidate, 0)) {
-          place = candidate;
-          this.settleSoon();
-        }
-      }
-    }
+    let place = held && held.overlayKey === overlayKey ? this.reuse(held, scene.transform, now) : null;
     if (!place) {
-      this.renderLayer(scene, key);
+      this.renderLayer(scene, bandsKey, overlayKey);
       held = this.held;
       place = { scale: 1, left: held.left, top: held.top, k, x, y };
+    } else if (held.bandsKey !== bandsKey) {
+      this.paintBands(scene, bandsKey);
     }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -488,6 +480,31 @@ export class Renderer {
       ctx.setTransform(place.scale, 0, 0, place.scale, place.left * dpr, place.top * dpr);
       ctx.drawImage(this.layer, 0, 0, held.pw, held.ph, 0, 0, held.pw, held.ph);
     }
+    return place;
+  }
+
+  // Where to put the layer held for a frame with this transform, or null if it has to be rendered again.
+  reuse(held, { k, x, y }, now) {
+    const { dpr } = this;
+    if (held.k === k) {
+      // Same scale: move the layer, by whole device pixels.
+      const left = Math.round((held.left + x - held.x) * dpr) / dpr;
+      const top = Math.round((held.top + y - held.y) * dpr) / dpr;
+      const place = { scale: 1, left, top, k, x: left - held.left + held.x, y: top - held.top + held.y };
+      if (!this.covers(held, place, 0)) return null;
+      // A view that has drifted near the layer's edge gets a fresh layer once it is still.
+      if (!this.covers(held, place, held.margin / 2)) {
+        if (now - this.movedAt >= SETTLE_MS) return null;
+        this.settleSoon();
+      }
+      return place;
+    }
+    if (now - this.zoomedAt >= SETTLE_MS) return null;
+    // Zooming: scale the layer for now, and render it sharp once the zoom rests.
+    const scale = k / held.k;
+    const place = { scale, left: (held.left - held.x) * scale + x, top: (held.top - held.y) * scale + y, k, x, y };
+    if (scale < 0.5 || scale > 2 || !this.covers(held, place, 0)) return null;
+    this.settleSoon();
     return place;
   }
 
@@ -516,10 +533,11 @@ export class Renderer {
     }, SETTLE_MS + 30);
   }
 
-  // Renders the map for the current transform over the window plus a margin, cut down to the map.
-  renderLayer(scene, key) {
+  // Renders the map for the current transform over the window plus a margin, cut down to the map:
+  // the overlay first, then the land and bands with the overlay laid over them.
+  renderLayer(scene, bandsKey, overlayKey) {
     const t0 = performance.now();
-    const { dpr, w, h, layer } = this;
+    const { dpr, w, h } = this;
     const { k, x, y } = scene.transform;
     const area = Math.min(LAYER_WINDOWS * w * h, LAYER_MAX_PIXELS / (dpr * dpr));
     const margin = Math.max(0, (Math.sqrt((w + h) ** 2 + 4 * (area - w * h)) - (w + h)) / 4);
@@ -529,38 +547,71 @@ export class Renderer {
     const top = Math.floor(Math.max(-margin, b.y0 * k + y - pad) * dpr) / dpr;
     const pw = Math.max(1, Math.ceil((Math.min(w + margin, b.x1 * k + x + pad) - left) * dpr));
     const ph = Math.max(1, Math.ceil((Math.min(h + margin, b.y1 * k + y + pad) - top) * dpr));
-
-    // The layer canvas only grows, so that panning and zooming don't keep reallocating it, unless it
-    // would pass the pixel limit or has become far bigger than needed. The part in use is cleared and
-    // clipped to.
-    if (pw > layer.width || ph > layer.height || 4 * pw * ph < layer.width * layer.height) {
-      const width = Math.max(pw, layer.width);
-      const height = Math.max(ph, layer.height);
-      const exact = 4 * pw * ph < layer.width * layer.height || width * height > LAYER_MAX_PIXELS;
-      layer.width = exact ? pw : width;
-      layer.height = exact ? ph : height;
-    }
-    const c = this.layerCtx;
-    c.setTransform(1, 0, 0, 1, 0, 0);
-    c.fillStyle = COLOURS.bg;
-    c.fillRect(0, 0, pw, ph);
-    c.save();
-    if (pw < layer.width || ph < layer.height) {
-      c.beginPath();
-      c.rect(0, 0, pw, ph);
-      c.clip();
-    }
-    c.setTransform(dpr * k, 0, 0, dpr * k, dpr * (x - left), dpr * (y - top));
     const region = { x0: (left - x) / k, y0: (top - y) / k, x1: (left + pw / dpr - x) / k, y1: (top + ph / dpr - y) / k };
-    this.drawMap(c, scene, k, region);
-    c.restore();
+    const held = { bandsKey, overlayKey, k, x, y, left, top, width: pw / dpr, height: ph / dpr, pw, ph, pad, margin, region };
 
-    this.held = { key, k, x, y, left, top, width: pw / dpr, height: ph / dpr, pw, ph, pad, margin };
+    const o = this.overlayCtx;
+    this.begin(o, this.overlay, held, false);
+    this.drawOverlay(o, scene, k, region);
+    o.restore();
+    this.held = held;
+    this.paintBands(scene, bandsKey);
     this.stats.layerMs = performance.now() - t0;
     this.stats.layerDraws++;
   }
 
-  drawMap(ctx, scene, k, region) {
+  // Paints the land and colour bands into the layer for the transform it holds, then lays the overlay
+  // over them.
+  paintBands(scene, bandsKey) {
+    const t0 = performance.now();
+    const held = this.held;
+    const c = this.layerCtx;
+    this.begin(c, this.layer, held, true);
+    c.fillStyle = COLOURS.land;
+    c.fill(this.paths.boroughs, 'evenodd');
+    // Travel-time bands, clipped to Greater London and painted lowest band first.
+    if (this.bandPaths) {
+      c.clip(this.paths.boroughs, 'evenodd');
+      scene.bands.list.forEach((band, i) => {
+        c.fillStyle = this.tint(band.colour);
+        c.fill(this.bandPaths[i], 'evenodd');
+      });
+    }
+    c.restore();
+    c.drawImage(this.overlay, 0, 0, held.pw, held.ph, 0, 0, held.pw, held.ph);
+    held.bandsKey = bandsKey;
+    this.stats.bandsMs = performance.now() - t0;
+  }
+
+  // Makes a layer canvas big enough for the part in use, which is cleared (or filled with the
+  // background) and clipped to, and sets the transform the layer is rendered with. The canvas only
+  // grows, so that panning and zooming don't keep reallocating it, unless it would pass the pixel
+  // limit or has become far bigger than needed. Balance with ctx.restore().
+  begin(ctx, canvas, { pw, ph, k, x, y, left, top }, opaque) {
+    if (pw > canvas.width || ph > canvas.height || 4 * pw * ph < canvas.width * canvas.height) {
+      const width = Math.max(pw, canvas.width);
+      const height = Math.max(ph, canvas.height);
+      const exact = 4 * pw * ph < canvas.width * canvas.height || width * height > LAYER_MAX_PIXELS;
+      canvas.width = exact ? pw : width;
+      canvas.height = exact ? ph : height;
+    }
+    const { dpr } = this;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (opaque) {
+      ctx.fillStyle = COLOURS.bg;
+      ctx.fillRect(0, 0, pw, ph);
+    } else ctx.clearRect(0, 0, pw, ph);
+    ctx.save();
+    if (pw < canvas.width || ph < canvas.height) {
+      ctx.beginPath();
+      ctx.rect(0, 0, pw, ph);
+      ctx.clip();
+    }
+    ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * (x - left), dpr * (y - top));
+  }
+
+  // Everything of the map drawn over the colour bands.
+  drawOverlay(ctx, scene, k, region) {
     const { paths, dpr } = this;
     const px = (n) => n / k;
     const cell = chunkCell(k, dpr);
@@ -568,20 +619,6 @@ export class Renderer {
     const coords = scene.mesh.warped; // the same as base unless the map is stretched
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-
-    ctx.fillStyle = COLOURS.land;
-    ctx.fill(paths.boroughs, 'evenodd');
-
-    // Travel-time bands, clipped to Greater London and painted lowest band first.
-    if (this.bandPaths) {
-      ctx.save();
-      ctx.clip(paths.boroughs, 'evenodd');
-      scene.bands.list.forEach((band, i) => {
-        ctx.fillStyle = this.tint(band.colour);
-        ctx.fill(this.bandPaths[i], 'evenodd');
-      });
-      ctx.restore();
-    }
 
     ctx.strokeStyle = COLOURS.landBorder;
     ctx.lineWidth = px(1);
