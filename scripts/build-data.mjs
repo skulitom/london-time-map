@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WalkGrid, rasterisePolygon, rasteriseLine } from '../src/walkgrid.js';
+import { packTransit } from '../src/transit.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CACHE = path.join(ROOT, 'scripts', 'cache');
@@ -670,7 +671,7 @@ fs.writeFileSync(path.join(OUT, 'base.json'), JSON.stringify(base));
 const grid = await buildGrid(base);
 fs.writeFileSync(path.join(OUT, 'walkgrid.json'), JSON.stringify(grid.toJSON()));
 const transit = await buildTransit();
-fs.writeFileSync(path.join(OUT, 'transit.json'), JSON.stringify(transit));
+fs.writeFileSync(path.join(OUT, 'transit.json'), JSON.stringify(packTransit(transit)));
 const places = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'places.json'), 'utf8'));
 fs.writeFileSync(path.join(OUT, 'places.json'), JSON.stringify(places));
 for (const stale of ['network.json']) {

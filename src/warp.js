@@ -54,11 +54,14 @@ export class Warp {
   baseX(i) { return this.points[2 * i]; }
   baseY(i) { return this.points[2 * i + 1]; }
 
-  // Finds the triangle containing (x, y) in geographic space by walking from the nearest point.
+  // Finds the triangle containing (x, y) in geographic space by walking from the nearest point. The
+  // search for that point starts from the last one found: vertices come in order along their rings,
+  // so it is usually a step or two away rather than a walk across the whole mesh.
   locate(x, y, out) {
     const xs = this.xs || (this.xs = Float64Array.from({ length: this.n }, (_, i) => this.points[2 * i]));
     const ys = this.ys || (this.ys = Float64Array.from({ length: this.n }, (_, i) => this.points[2 * i + 1]));
-    let t = this.pointTri[this.delaunay.find(x, y)];
+    this.nearest = this.delaunay.find(x, y, this.nearest || 0);
+    let t = this.pointTri[this.nearest];
     if (t < 0) t = 0;
     for (let iter = 0; iter < 200; iter++) {
       this.bary(t, x, y, xs, ys, out);
