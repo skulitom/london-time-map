@@ -47,8 +47,8 @@ The `.nojekyll` file keeps GitHub from running Jekyll on the files.
 
 ## How it works
 
-The page draws everything itself on a canvas with [D3](https://d3js.org) (projection, contours,
-zoom). Each time the start point or the tick boxes change:
+The page draws everything itself on a canvas with [D3](https://d3js.org) (projection, zoom). Each
+time the start point or the tick boxes change:
 
 1. **One shortest-path search** (`src/engine.js`) runs over a graph that joins the walking grid
    (`src/walkgrid.js`, about 143,000 cells) with one platform node per stop and line. Walking moves
@@ -57,7 +57,8 @@ zoom). Each time the start point or the tick boxes change:
    are computed directly from distance with speeds that slow towards the centre. The whole search
    takes a fraction of a second.
 2. **Colour bands** are the filled contours of the resulting travel-time surface
-   (`d3.contours`), clipped to Greater London and tinted onto the land.
+   (`src/contours.js`: the same rings `d3.contours` traces, found in a fraction of the time), clipped
+   to Greater London and tinted onto the land.
 3. **Stations and landmarks** take the time of their grid cell; hovering one walks the search tree
    back to the start to show the legs.
 
@@ -69,14 +70,25 @@ meant to show the *shape* of London in time, not to replace a journey planner.
 
 The map holds a lot of geometry: 33 borough outlines, the Thames and 345 other water bodies, 65
 parks, 787 trunk and motorway runs, 34 rail lines, about 25,000 bus links and 916 labelled places.
-Three rules keep that cheap to interact with:
+Almost all of what a frame of that costs is rasterisation, which the browser does after the drawing
+calls have returned (Chrome does it on the GPU process), so it never shows up in a JavaScript
+profile: a pan frame that took 2 ms of script used to take 85 ms to rasterise, even on a fast
+graphics card. These rules keep it cheap:
 
 - **Nothing is drawn twice.** Every input to the picture goes into one key; if the key matches the
   last frame, `draw()` returns without touching the canvas. An idle map runs no timers and repaints
   nothing.
+- **The map is a layer.** Land, colour bands, water, roads and the bus and rail networks are rendered
+  into an offscreen canvas that covers the window plus a margin. Panning copies it, moved by whole
+  pixels, and hovering redraws only the route, stations, places and labels on top of it. Zooming
+  scales the copy, and the layer is rendered sharp again once the zoom has been still for 150 ms.
+- **Paths stay small.** Chrome rasterises a stroked path that spans the screen many times more slowly
+  than the same lines cut into pieces a hundred or so pixels across, so the bus network and the roads
+  are drawn in chunks sized to the zoom level and chunks out of view are skipped. National Rail
+  dashes are laid out in script rather than by the canvas, which dashes every line from end to end
+  however little of it is on screen.
 - **Paths are built once.** Geometry lives in `Path2D` objects in base coordinates and is re-used
-  under the canvas transform, so panning and zooming re-rasterise but never rebuild a path. A full
-  repaint is under a millisecond; hovering a place, which also draws its route, is a millisecond or two.
+  under the canvas transform. Only the colour bands are rebuilt when the times change.
 - **Recalculation happens in one task.** Changing the start point or a tick box runs the search, the
   surface and the contours start to finish and then paints, so the map is never left half-drawn, not
   even in a window that is hidden or behind another one and therefore gets no animation frames.
@@ -84,6 +96,10 @@ Three rules keep that cheap to interact with:
 Driving times are only integrated where a car could actually win: the cheapest conceivable drive is
 the fixed overhead plus the straight line at top speed, and any place already reached sooner by
 another mode skips the integral. That is an exact shortcut, not an approximation.
+
+Loading follows the same idea. `index.html` preloads the data files and the modules, so they
+download alongside D3 instead of after it, and the bulky tables in `data/transit.json` are stored
+as delta-encoded columns, which download at about a third of the size and parse in half the time.
 
 ## Data
 
@@ -99,7 +115,7 @@ minutes.
 
 | File | Contents | Source |
 | --- | --- | --- |
-| `data/transit.json` | Lines, stops, stations, platforms and stop-to-stop hops for rail and every bus route; rail route geometry | [TfL Unified API](https://api.tfl.gov.uk) |
+| `data/transit.json` | Lines, stops, stations, platforms and stop-to-stop hops for rail and every bus route; rail route geometry. Stops, platforms and hops are stored as delta-encoded columns (`src/transit.js`) | [TfL Unified API](https://api.tfl.gov.uk) |
 | `data/walkgrid.json` | Walkable-cell mask (water minus bridges and foot tunnels) and a Greater London mask, bit-packed | OpenStreetMap water areas and bridges, ONS boundaries |
 | `data/base.json` | Borough boundaries, River Thames, other water bodies, major parks, motorways and trunk roads | [ONS Open Geography Portal](https://geoportal.statistics.gov.uk), [OpenStreetMap](https://www.openstreetmap.org/copyright) via Overpass |
 | `data/places.json` | About 120 landmarks and town centres with label priority | `scripts/places.json`, hand-curated |

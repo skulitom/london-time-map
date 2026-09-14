@@ -4,6 +4,8 @@ import { Engine, toMetres, METRES_PER_DEG } from './engine.js';
 import { WalkGrid } from './walkgrid.js';
 import { Warp } from './warp.js';
 import { Renderer, COLOURS, blend } from './render.js';
+import { contourBands } from './contours.js';
+import { unpackTransit } from './transit.js';
 import { MODES, BANDS, BAND_THRESHOLDS, UNREACHABLE_COLOUR, CENTRE, carMinutes, carFloorMinutes, CAR_MINUTES_PER_METRE, CAR } from './model.js';
 
 const DEFAULT_ORIGIN = { lat: 51.508, lon: -0.1281, name: 'Trafalgar Square', node: -1 };
@@ -78,25 +80,28 @@ async function lookupPostcode(text) {
 }
 
 async function main() {
-  const [base, gridJson, transit, places] = await Promise.all([
+  const [base, gridJson, transitJson, places] = await Promise.all([
     loadJSON('data/base.json'), loadJSON('data/walkgrid.json'), loadJSON('data/transit.json'), loadJSON('data/places.json'),
   ]);
   readHash();
 
+  const transit = unpackTransit(transitJson);
   const grid = WalkGrid.fromJSON(gridJson);
   const engine = new Engine(transit, grid);
   const C = grid.count;
+  const { stopLat, stopLon, platformStop, platformLine, rideFrom, rideTo } = transit;
 
   // ---------------------------------------------------------------- places and stations
   const stationByStop = new Map(transit.stations.map((s, i) => [s.stop, i]));
   const stationLines = transit.stations.map(() => new Set());
-  for (const [stop, line] of transit.platforms) {
+  for (let p = 0; p < platformStop.length; p++) {
+    const stop = platformStop[p];
+    const line = platformLine[p];
     if (RAIL_MODES.has(transit.lines[line].mode) && stationByStop.has(stop)) stationLines[stationByStop.get(stop)].add(line);
   }
   const nodes = [];
   transit.stations.forEach((s, i) => {
-    const [lat, lon] = transit.stops[s.stop];
-    nodes.push({ name: s.name, lat, lon, kind: 'station', hub: s.hub, modes: s.modes, lineIds: stationLines[i], stop: s.stop, index: nodes.length });
+    nodes.push({ name: s.name, lat: stopLat[s.stop], lon: stopLon[s.stop], kind: 'station', hub: s.hub, modes: s.modes, lineIds: stationLines[i], stop: s.stop, index: nodes.length });
   });
   for (const p of places) nodes.push({ name: p.name, lat: p.lat, lon: p.lon, kind: 'place', tier: p.tier, lineIds: new Set(), index: nodes.length });
   const N = nodes.length;
@@ -156,21 +161,25 @@ async function main() {
     if (!layers.railByMode[line.mode]) layers.railByMode[line.mode] = [];
     layers.railByMode[line.mode].push([li, segs]);
   });
-  const mesh = { base: Float64Array.from(meshList), warped: new Float32Array(meshList.length) };
+  const mesh = { base: Float64Array.from(meshList), warped: Float32Array.from(meshList) };
 
-  // Bus network as straight stop-to-stop segments (one per undirected pair).
+  // Bus network as straight stop-to-stop segments (one per undirected pair), projecting each stop once.
   const busPairs = new Set();
   const busList = [];
-  for (const [from, to] of transit.rides) {
-    if (transit.lines[transit.platforms[from][1]].mode !== 'bus') continue;
-    const a = transit.platforms[from][0];
-    const b = transit.platforms[to][0];
+  const stopXY = new Float64Array(2 * stopLat.length).fill(NaN);
+  const stopPoint = (s) => {
+    if (Number.isNaN(stopXY[2 * s])) [stopXY[2 * s], stopXY[2 * s + 1]] = proj(stopLon[s], stopLat[s]);
+    busList.push(stopXY[2 * s], stopXY[2 * s + 1]);
+  };
+  for (let r = 0; r < rideFrom.length; r++) {
+    if (transit.lines[platformLine[rideFrom[r]]].mode !== 'bus') continue;
+    const a = platformStop[rideFrom[r]];
+    const b = platformStop[rideTo[r]];
     const key = a < b ? a * 1e6 + b : b * 1e6 + a;
     if (busPairs.has(key)) continue;
     busPairs.add(key);
-    const [alat, alon] = transit.stops[a];
-    const [blat, blon] = transit.stops[b];
-    busList.push(...proj(alon, alat), ...proj(blon, blat));
+    stopPoint(a);
+    stopPoint(b);
   }
   const busSegments = Float32Array.from(busList);
 
@@ -195,17 +204,27 @@ async function main() {
   const cy = (baseBounds.y0 + baseBounds.y1) / 2;
   const rx = (baseBounds.x1 - baseBounds.x0) * 0.95;
   const ry = (baseBounds.y1 - baseBounds.y0) * 0.95;
-  const ringNeighbours = [];
   for (let j = 0; j < RING_POINTS; j++) {
     const a = (j / RING_POINTS) * Math.PI * 2;
     cpX[N + j] = cx + rx * Math.cos(a);
     cpY[N + j] = cy + ry * Math.sin(a);
-    const nearest = Array.from({ length: N }, (_, i) => [Math.hypot(cpX[i] - cpX[N + j], cpY[i] - cpY[N + j]), i])
-      .sort((p, q) => p[0] - q[0]).slice(0, 8).map((p) => p[1]);
-    ringNeighbours.push(nearest);
   }
-  const warp = new Warp(cpX, cpY);
-  const binding = warp.bind(mesh.base);
+
+  // The mesh warp only serves the time-stretch option, so it is built the first time that is used.
+  let stretch = null;
+  function stretcher() {
+    if (!stretch) {
+      const warp = new Warp(cpX, cpY);
+      const ringNeighbours = [];
+      for (let j = 0; j < RING_POINTS; j++) {
+        const nearest = Array.from({ length: N }, (_, i) => [Math.hypot(cpX[i] - cpX[N + j], cpY[i] - cpY[N + j]), i])
+          .sort((p, q) => p[0] - q[0]).slice(0, 8).map((p) => p[1]);
+        ringNeighbours.push(nearest);
+      }
+      stretch = { warp, binding: warp.bind(mesh.base), ringNeighbours };
+    }
+    return stretch;
+  }
 
   // Grid cells project cheaply: Mercator is affine in longitude, and latitude only depends on the
   // row, so one multiply plus a row table replaces a projection call per vertex. Worth it because
@@ -323,46 +342,34 @@ async function main() {
     lastTiming = { routeMs: t1 - t0, surfaceMs: t2 - t1, bandsMs: performance.now() - t2 };
   }
 
-  // Filled contour bands of the travel-time surface, in base coordinates.
+  // Filled contour bands of the travel-time surface, in base coordinates. Each band is a set of rings
+  // (first vertex, vertex count) to fill with the even-odd rule.
   const bandValues = new Float64Array(C);
+  const bandThresholds = [...BAND_THRESHOLDS, 1e8];
   function buildBands(surf) {
     for (let c = 0; c < C; c++) bandValues[c] = Number.isFinite(surf[c]) ? surf[c] : 1e9;
-    const contours = d3.contours().size([grid.cols, grid.rows]).thresholds([...BAND_THRESHOLDS, 1e8])(bandValues);
-    let total = 0;
-    for (const contour of contours) for (const polygon of contour.coordinates) for (const ring of polygon) total += ring.length;
-    const baseCoords = new Float64Array(total * 2);
-    const list = [];
-    let at = 0;
-    contours.forEach((contour, k) => {
-      const polygons = [];
-      for (const polygon of contour.coordinates) {
-        const rings = [];
-        for (const ring of polygon) {
-          const start = at;
-          for (let v = 0; v < ring.length; v++) {
-            baseCoords[2 * at] = gridX0 + ring[v][0] * gridDX;
-            baseCoords[2 * at + 1] = gridProjY(ring[v][1]);
-            at++;
-          }
-          rings.push([start, ring.length]);
-        }
-        polygons.push(rings);
-      }
-      list.push({ colour: k < BANDS.length ? BANDS[k].colour : UNREACHABLE_COLOUR, polygons });
-    });
-    return { base: baseCoords, coords: baseCoords, list, binding: null, warped: null };
+    const { coords, bands } = contourBands(bandValues, grid.cols, grid.rows, bandThresholds);
+    for (let i = 0; i < coords.length; i += 2) {
+      coords[i] = gridX0 + coords[i] * gridDX;
+      coords[i + 1] = gridProjY(coords[i + 1]);
+    }
+    const list = bands.map((rings, k) => ({ colour: k < BANDS.length ? BANDS[k].colour : UNREACHABLE_COLOUR, rings }));
+    return { base: coords, coords, list, binding: null, warped: null };
   }
 
-  // Time-stretch targets (experimental): bearing kept, radius proportional to minutes.
+  // Time-stretch targets (experimental): bearing kept, radius proportional to minutes. They depend on
+  // the times and the start point but not on how far the map is stretched, so they are worked out
+  // once per recalculation, the first time the stretch needs them.
+  let full = null;
+  function fullStretch() {
+    if (!full) full = computeFull();
+    return full;
+  }
+
   function computeFull() {
     const tx = new Float64Array(cpCount);
     const ty = new Float64Array(cpCount);
     const [ox, oy] = originBase;
-    if (!times || state.morph <= 0) {
-      tx.set(cpX);
-      ty.set(cpY);
-      return { tx, ty, ringScale: 0 };
-    }
     let num = 0;
     let den = 0;
     for (let i = 0; i < N; i++) {
@@ -391,6 +398,7 @@ async function main() {
       tx[i] = ox + (cpX[i] - ox) * rho[i];
       ty[i] = oy + (cpY[i] - oy) * rho[i];
     }
+    const { ringNeighbours } = stretcher();
     for (let j = 0; j < RING_POINTS; j++) {
       const rhos = ringNeighbours[j].map((i) => rho[i]).sort((p, q) => p - q);
       const median = rhos[Math.floor(rhos.length / 2)];
@@ -400,33 +408,45 @@ async function main() {
     return { tx, ty, ringScale };
   }
 
-  function withMorph(full) {
+  // Control point positions at the current stretch.
+  function withMorph() {
     const sVal = state.morph;
     const tx = new Float64Array(cpCount);
     const ty = new Float64Array(cpCount);
-    for (let i = 0; i < cpCount; i++) {
-      tx[i] = cpX[i] + sVal * (full.tx[i] - cpX[i]);
-      ty[i] = cpY[i] + sVal * (full.ty[i] - cpY[i]);
+    if (sVal <= 0 || !times) {
+      tx.set(cpX);
+      ty.set(cpY);
+      return { tx, ty, ringScale: 0 };
     }
-    return { tx, ty, ringScale: full.ringScale };
+    const target = fullStretch();
+    for (let i = 0; i < cpCount; i++) {
+      tx[i] = cpX[i] + sVal * (target.tx[i] - cpX[i]);
+      ty[i] = cpY[i] + sVal * (target.ty[i] - cpY[i]);
+    }
+    return { tx, ty, ringScale: target.ringScale };
   }
 
   // ---------------------------------------------------------------- rendering and animation
   const canvas = $('map');
-  const renderer = new Renderer(canvas);
+  const renderer = new Renderer(canvas, { onSettle: () => requestFrame() });
   let transform = d3.zoomIdentity;
-  let full = { tx: cpX.slice(), ty: cpY.slice(), ringScale: 0 };
   let cur = { tx: cpX.slice(), ty: cpY.slice(), ringScale: 0 };
   let anim = null;
   let frameRequested = false;
   let route = null;
+  let wasStretched = false;
 
+  // Geometry only moves while the map is stretched, so the version only changes then (and once more
+  // on the way back), leaving the renderer's paths and map layer alone otherwise.
   function applyWarp() {
-    const stretched = state.morph > 0 || anim;
-    if (stretched) warp.apply(binding, cur.tx, cur.ty, mesh.warped);
-    else mesh.warped.set(mesh.base);
+    const stretched = state.morph > 0 || !!anim;
+    if (stretched) {
+      const { warp, binding } = stretcher();
+      warp.apply(binding, cur.tx, cur.ty, mesh.warped);
+    } else if (wasStretched) mesh.warped.set(mesh.base);
     if (bandsGeom) {
       if (stretched) {
+        const { warp } = stretcher();
         if (!bandsGeom.binding) {
           bandsGeom.binding = warp.bind(bandsGeom.base);
           bandsGeom.warped = new Float32Array(bandsGeom.base.length);
@@ -435,12 +455,13 @@ async function main() {
         bandsGeom.coords = bandsGeom.warped;
       } else bandsGeom.coords = bandsGeom.base;
     }
-    geomVersion++;
+    if (stretched || wasStretched) geomVersion++;
+    wasStretched = stretched;
   }
 
   function draw() {
     return renderer.draw({
-      transform, layers, mesh, lines: transit.lines, enabled: state.enabled,
+      transform, layers, mesh, lines: transit.lines, enabled: state.enabled, warped: state.morph > 0 || !!anim,
       bands: bandsGeom, busSegments, showBus: state.showBus && state.morph === 0 && !anim,
       nodes, nodeX: cur.tx, nodeY: cur.ty, times,
       origin: { x: originBase[0], y: originBase[1], name: state.origin.name, node: state.origin.node },
@@ -506,8 +527,9 @@ async function main() {
   let viewBounds = baseBounds;
   function fitTransform(bounds = viewBounds) {
     viewBounds = bounds;
-    const W = canvas.clientWidth || window.innerWidth || 1280;
-    const H = canvas.clientHeight || window.innerHeight || 720;
+    // The size measured at the last resize: reading the canvas here would force a layout.
+    const W = renderer.w || window.innerWidth || 1280;
+    const H = renderer.h || window.innerHeight || 720;
     const panelW = W > 760 ? 360 : 0;
     const pad = 24;
     const bw = Math.max(bounds.x1 - bounds.x0, 1);
@@ -543,11 +565,11 @@ async function main() {
   const statsEl = $('stats');
 
   // Runs start to finish in one task, so a click always lands on a fully drawn map. The whole
-  // recalculation is around a tenth of a second, short enough not to need progress reporting.
+  // recalculation takes a few hundredths of a second, short enough not to need progress reporting.
   function recompute() {
     compute();
-    full = computeFull();
-    const target = withMorph(full);
+    full = null;
+    const target = withMorph();
     updateRoute();
     updateStats();
     invalidateTooltip();
@@ -564,13 +586,16 @@ async function main() {
     }
   }
 
+  // Dragging the slider fires input events far faster than anyone needs the address bar updated, and
+  // browsers throttle history updates, so the hash is written once the slider pauses.
+  let hashTimer = 0;
   function remorph() {
-    full = computeFull();
-    const target = withMorph(full);
+    const target = withMorph();
     cur = { tx: target.tx, ty: target.ty, ringScale: target.ringScale };
     anim = null;
     applyWarp();
-    writeHash();
+    clearTimeout(hashTimer);
+    hashTimer = setTimeout(writeHash, 250);
     if (autoFit) selection.call(zoom.transform, fitTransform(boundsOf(target)));
     draw();
   }
@@ -746,7 +771,7 @@ async function main() {
     const { x: tx, y: ty, k } = transform;
     const bx = (ev.clientX - tx) / k;
     const by = (ev.clientY - ty) / k;
-    const inv = state.morph > 0 ? warp.invert(bx, by, cur.tx, cur.ty) : [bx, by];
+    const inv = state.morph > 0 ? stretcher().warp.invert(bx, by, cur.tx, cur.ty) : [bx, by];
     if (!inv) return;
     const [lon, lat] = projection.invert(inv);
     if (grid.cellOf(lon, lat) < 0) return;
@@ -803,11 +828,14 @@ async function main() {
   const list = $('placeList');
   const byName = new Map();
   for (const node of nodes) if (!byName.has(node.name.toLowerCase())) byName.set(node.name.toLowerCase(), node);
-  for (const node of [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+  const collator = new Intl.Collator();
+  const options = document.createDocumentFragment();
+  for (const node of [...byName.values()].sort((a, b) => collator.compare(a.name, b.name))) {
     const opt = document.createElement('option');
     opt.value = node.name;
-    list.appendChild(opt);
+    options.appendChild(opt);
   }
+  list.appendChild(options);
   const search = $('search');
   let searching = false;
   const applySearch = async () => {
@@ -851,7 +879,8 @@ async function main() {
 
   // Debug handle (not used by the page itself).
   window.__app = {
-    engine, grid, state, nodes, warp, cpX, cpY,
+    engine, grid, state, nodes, cpX, cpY,
+    get warp() { return stretcher().warp; },
     get result() { return lastResult; },
     get times() { return times; },
     get surface() { return surface; },
@@ -862,25 +891,33 @@ async function main() {
     screenOf(i) { return [cur.tx[i] * transform.k + transform.x, cur.ty[i] * transform.k + transform.y]; },
     gridProject(gx, gy) { return [gridX0 + gx * gridDX, gridProjY(gy)]; },
     journeyTo,
-    timeFrame({ relayout = false, rebuildPaths = false } = {}) {
-      if (rebuildPaths) renderer.pathKey = null;
-      if (relayout) renderer.frameKey = null;
+    // Times one draw. relayout repaints even if nothing changed, rerender also renders the map layer
+    // again, and rebuildPaths also rebuilds every path.
+    timeFrame({ relayout = false, rerender = false, rebuildPaths = false } = {}) {
+      if (rebuildPaths) renderer.pathKey = renderer.bandKey = null;
+      if (rebuildPaths || rerender) renderer.held = null;
+      if (rebuildPaths || rerender || relayout) renderer.frameKey = null;
       const t0 = performance.now();
       const painted = draw();
-      return { ms: performance.now() - t0, painted, pathMs: renderer.stats.pathMs };
+      return { ms: performance.now() - t0, painted, pathMs: renderer.stats.pathMs, layerMs: renderer.stats.layerMs };
     },
   };
 
   // ---------------------------------------------------------------- go
+  // recompute() paints the first frame, in this same task.
   state.origin = snapOrigin(state.origin);
   originBase = proj(state.origin.lon, state.origin.lat);
   $('originName').textContent = state.origin.name;
   cur = { tx: cpX.slice(), ty: cpY.slice(), ringScale: 0 };
   applyWarp();
-  draw();
   $('loading').classList.add('done');
   recompute();
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => requestFrame());
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      renderer.fontsChanged();
+      requestFrame();
+    });
+  }
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestFrame(); });
 }
 

@@ -1,13 +1,21 @@
 // Canvas renderer.
 //
-// Two things keep interaction cheap:
+// Almost all of what a frame costs is rasterisation, which the browser does after draw() returns
+// (in Chrome, on the GPU process), so the renderer is built around rasterising as little as possible:
 //   - A frame is only drawn when something it depends on has changed. Every input to the picture
 //     (transform, data, toggles, hovered place, size) goes into one key; if the key matches the last
-//     frame the canvas already holds the right pixels and draw() returns without touching it. So an
-//     idle map costs nothing at all.
-//   - Geometry is held as Path2D objects in base coordinates and re-used under the canvas transform,
-//     rebuilt only when the geometry itself moves. Panning and zooming never rebuild a path, which
-//     is what used to dominate each frame.
+//     frame the canvas already holds the right pixels and draw() returns without touching it.
+//   - The map itself (land, colour bands, water, roads, the bus and rail networks) is rendered into
+//     an offscreen layer covering the window plus a margin, and frames copy it. Panning moves the copy
+//     by whole device pixels, and hovering redraws only what sits on top of it: the route, stations,
+//     places and labels. While zooming the copy is scaled, and once the zoom has been still for a
+//     moment the layer is rendered sharp at the new scale.
+//   - Chrome rasterises a stroked path whose bounds span the screen far more slowly than the same
+//     lines cut into pieces a hundred or so pixels across. So the bus network and the roads are drawn
+//     in chunks sized to the zoom level, National Rail dashes are laid out here rather than by the
+//     canvas (which dashes the whole of every line, off-screen parts included), and chunks out of view
+//     are skipped.
+//   - Geometry is held as Path2D objects in base coordinates and re-used under the canvas transform.
 
 import { GROUP_OF_MODE, RING_MINUTES, bandColour } from './model.js';
 
@@ -37,6 +45,12 @@ const TAU = Math.PI * 2;
 const MODE_ORDER = ['national-rail', 'tram', 'overground', 'elizabeth-line', 'dlr', 'tube'];
 const MODE_WIDTH = { tube: 2.4, dlr: 2, 'elizabeth-line': 2.4, overground: 2, tram: 1.6, 'national-rail': 1.2 };
 
+const CHUNK_PX = 128;           // target size of a chunk of lines, in device pixels
+const NODE_CELL_PX = 128;       // station and place markers are batched per cell of this many pixels
+const SETTLE_MS = 150;          // a scaled layer is rendered sharp once the zoom has been still this long
+const LAYER_WINDOWS = 2.5;      // the map layer covers at most this many windows' worth of pixels...
+const LAYER_MAX_PIXELS = 16e6;  // ...and never more than iOS Safari allows one canvas
+
 function hexToRgb(hex) {
   const n = parseInt(hex.slice(1), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
@@ -50,30 +64,206 @@ export function blend(top, bottom, opacity) {
   return `rgb(${mix[0]},${mix[1]},${mix[2]})`;
 }
 
+// ---------------------------------------------------------------- chunks
+
+const cellKey = (x, y, cell) => (Math.floor(x / cell) + 32768) * 65536 + (Math.floor(y / cell) + 32768);
+
+// Chunk size in base units at a zoom level: the power of two nearest CHUNK_PX device pixels.
+function chunkCell(k, dpr) {
+  return Math.max(4, Math.min(512, 2 ** Math.round(Math.log2(CHUNK_PX / (k * dpr)))));
+}
+
+function chunkAt(chunks, key) {
+  let chunk = chunks.get(key);
+  if (!chunk) {
+    chunk = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity, path: new Path2D() };
+    chunks.set(key, chunk);
+  }
+  return chunk;
+}
+
+function grow(chunk, x, y) {
+  if (x < chunk.x0) chunk.x0 = x;
+  if (x > chunk.x1) chunk.x1 = x;
+  if (y < chunk.y0) chunk.y0 = y;
+  if (y > chunk.y1) chunk.y1 = y;
+}
+
+// Segments given as x0, y0, x1, y1 quadruples, each added to the chunk holding its midpoint.
+function segmentChunks(seg, cell) {
+  const chunks = new Map();
+  for (let i = 0; i < seg.length; i += 4) {
+    const chunk = chunkAt(chunks, cellKey((seg[i] + seg[i + 2]) / 2, (seg[i + 1] + seg[i + 3]) / 2, cell));
+    chunk.path.moveTo(seg[i], seg[i + 1]);
+    chunk.path.lineTo(seg[i + 2], seg[i + 3]);
+    grow(chunk, seg[i], seg[i + 1]);
+    grow(chunk, seg[i + 2], seg[i + 3]);
+  }
+  return [...chunks.values()];
+}
+
+// Polylines ([start, count] runs of interleaved coordinates) cut into pieces no wider or taller than
+// a cell, each added to the chunk where it starts. Neighbouring pieces share a vertex, so with round
+// caps they join up exactly as the unbroken line would with round joins.
+function polylineChunks(coords, runs, cell) {
+  const chunks = new Map();
+  const emit = (from, to) => {
+    const chunk = chunkAt(chunks, cellKey(coords[2 * from], coords[2 * from + 1], cell));
+    chunk.path.moveTo(coords[2 * from], coords[2 * from + 1]);
+    grow(chunk, coords[2 * from], coords[2 * from + 1]);
+    for (let i = from + 1; i <= to; i++) {
+      chunk.path.lineTo(coords[2 * i], coords[2 * i + 1]);
+      grow(chunk, coords[2 * i], coords[2 * i + 1]);
+    }
+  };
+  for (const [start, count] of runs) {
+    const end = start + count - 1;
+    if (end <= start) continue;
+    let from = start;
+    let x0 = coords[2 * start];
+    let y0 = coords[2 * start + 1];
+    let x1 = x0;
+    let y1 = y0;
+    for (let i = start + 1; i <= end; i++) {
+      const x = coords[2 * i];
+      const y = coords[2 * i + 1];
+      if (i - 1 > from && (Math.max(x1, x) - Math.min(x0, x) > cell || Math.max(y1, y) - Math.min(y0, y) > cell)) {
+        emit(from, i - 1);
+        from = i - 1;
+        x0 = x1 = coords[2 * from];
+        y0 = y1 = coords[2 * from + 1];
+      }
+      x0 = Math.min(x0, x);
+      x1 = Math.max(x1, x);
+      y0 = Math.min(y0, y);
+      y1 = Math.max(y1, y);
+    }
+    emit(from, end);
+  }
+  return [...chunks.values()];
+}
+
+// The dashes a canvas draws along polylines with the pattern [on, off], which starts afresh at each
+// run and carries on through its vertices. Only dashes on segments near the region are built, and
+// each dash goes whole into the chunk where it starts.
+function dashChunks(coords, runs, on, off, cell, region, pad) {
+  const period = on + off;
+  const rx0 = region.x0 - pad;
+  const ry0 = region.y0 - pad;
+  const rx1 = region.x1 + pad;
+  const ry1 = region.y1 + pad;
+  const paths = new Map();
+  let path = null;
+  for (const [start, count] of runs) {
+    let d0 = 0;
+    let open = false; // the previous segment ended part-way through a dash
+    for (let i = start; i < start + count - 1; i++) {
+      const ax = coords[2 * i];
+      const ay = coords[2 * i + 1];
+      const bx = coords[2 * i + 2];
+      const by = coords[2 * i + 3];
+      const len = Math.hypot(bx - ax, by - ay);
+      if (len === 0) continue;
+      const d1 = d0 + len;
+      if (Math.max(ax, bx) < rx0 || Math.min(ax, bx) > rx1 || Math.max(ay, by) < ry0 || Math.min(ay, by) > ry1) {
+        open = false;
+        d0 = d1;
+        continue;
+      }
+      const continuing = open;
+      open = false;
+      for (let n = Math.floor(d0 / period); n * period < d1; n++) {
+        const a = n * period;
+        const b = a + on;
+        if (b <= d0) continue;
+        if (a >= d0 || !continuing) {
+          const t = (Math.max(a, d0) - d0) / len;
+          const x = ax + (bx - ax) * t;
+          const y = ay + (by - ay) * t;
+          const key = cellKey(x, y, cell);
+          path = paths.get(key);
+          if (!path) paths.set(key, (path = new Path2D()));
+          path.moveTo(x, y);
+        }
+        const t = (Math.min(b, d1) - d0) / len;
+        path.lineTo(ax + (bx - ax) * t, ay + (by - ay) * t);
+        open = b > d1;
+      }
+      d0 = d1;
+    }
+  }
+  return [...paths.values()];
+}
+
+function strokeVisible(ctx, chunks, region, pad) {
+  for (const c of chunks) {
+    if (c.x1 >= region.x0 - pad && c.x0 <= region.x1 + pad && c.y1 >= region.y0 - pad && c.y0 <= region.y1 + pad) ctx.stroke(c.path);
+  }
+}
+
+function boundsOf(coords, bounds = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }) {
+  for (let i = 0; i < coords.length; i += 2) {
+    const x = coords[i];
+    const y = coords[i + 1];
+    if (x < bounds.x0) bounds.x0 = x;
+    if (x > bounds.x1) bounds.x1 = x;
+    if (y < bounds.y0) bounds.y0 = y;
+    if (y > bounds.y1) bounds.y1 = y;
+  }
+  return bounds;
+}
+
+// ---------------------------------------------------------------- renderer
+
 export class Renderer {
-  constructor(canvas) {
+  // onSettle is called when a frame should be drawn again although nothing in the scene changed:
+  // the zoom has come to rest and the scaled map layer can now be rendered sharp.
+  constructor(canvas, { onSettle = () => {} } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: false });
+    this.layer = document.createElement('canvas');
+    this.layer.width = 1;
+    this.layer.height = 1;
+    this.layerCtx = this.layer.getContext('2d', { alpha: false });
+    this.held = null; // what the layer holds, and for which transform
+    this.onSettle = onSettle;
+    this.settleTimer = 0;
+    this.last = null;
+    this.zoomedAt = -Infinity;
+    this.movedAt = -Infinity;
     this.dpr = 1;
     this.w = 0;
     this.h = 0;
     this.paths = null;
     this.pathKey = null;
+    this.bandPaths = null;
+    this.bandKey = null;
+    this.bounds = null;
+    this.ghost = null;
+    this.chunks = new Map();
     this.frameKey = null;
     this.nodeScreen = null;
-    this.nodeBuckets = new Map();
+    this.nodeStyles = new Map();
     this.textWidths = new Map();
     this.tintCache = new Map();
-    this.stats = { drawMs: 0, pathMs: 0, draws: 0, skipped: 0 };
+    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, draws: 0, layerDraws: 0, skipped: 0 };
   }
 
+  // Setting a canvas's size clears it, even to the same size, so that only happens on a real change.
   resize() {
-    this.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-    this.w = this.canvas.clientWidth;
-    this.h = this.canvas.clientHeight;
-    this.canvas.width = Math.max(1, Math.round(this.w * this.dpr));
-    this.canvas.height = Math.max(1, Math.round(this.h * this.dpr));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const w = this.canvas.clientWidth;
+    const h = this.canvas.clientHeight;
+    const width = Math.max(1, Math.round(w * dpr));
+    const height = Math.max(1, Math.round(h * dpr));
+    if (dpr === this.dpr && w === this.w && h === this.h && width === this.canvas.width && height === this.canvas.height) return false;
+    this.dpr = dpr;
+    this.w = w;
+    this.h = h;
+    this.canvas.width = width;
+    this.canvas.height = height;
     this.frameKey = null;
+    return true;
   }
 
   tint(colour) {
@@ -95,12 +285,24 @@ export class Renderer {
     return width;
   }
 
+  // Text widths depend on the font, so they are measured again once web fonts have loaded.
+  fontsChanged() {
+    this.textWidths.clear();
+    this.frameKey = null;
+  }
+
   // ---------------------------------------------------------------- geometry paths
 
+  // A ring is closed by returning to its first point rather than with closePath(), which in Chrome
+  // costs time in proportion to the whole path so far: building every path of the map took 5 ms
+  // with it and 2 ms without. Every stroke here has round caps and joins, so the outline is the same.
   static addRing(path, coords, start, count, close) {
-    path.moveTo(coords[2 * start], coords[2 * start + 1]);
+    const x0 = coords[2 * start];
+    const y0 = coords[2 * start + 1];
+    path.moveTo(x0, y0);
     for (let i = start + 1; i < start + count; i++) path.lineTo(coords[2 * i], coords[2 * i + 1]);
-    if (close) path.closePath();
+    const last = start + count - 1;
+    if (close && (coords[2 * last] !== x0 || coords[2 * last + 1] !== y0)) path.lineTo(x0, y0);
   }
 
   static polysPath(coords, polys) {
@@ -115,50 +317,57 @@ export class Renderer {
     return path;
   }
 
+  // Map geometry is rebuilt only when it moves (the time-stretch option), colour bands whenever they
+  // are recalculated. The bus network, the ghost outline and line chunks never move, so they are built
+  // once, the chunks lazily for each zoom level that needs them.
   ensurePaths(scene) {
-    const key = `${scene.geomVersion}|${scene.bandsVersion}`;
-    if (key === this.pathKey && this.paths) return;
     const t0 = performance.now();
-    const W = scene.mesh.warped;
-    const L = scene.layers;
-    const paths = {
-      boroughs: Renderer.polysPath(W, L.boroughs),
-      ghost: Renderer.polysPath(scene.mesh.base, L.boroughs),
-      parks: Renderer.polysPath(W, L.parks),
-      thames: Renderer.polysPath(W, L.thames),
-      water: Renderer.polysPath(W, L.water),
-      thamesLine: Renderer.segsPath(W, L.thamesLine),
-      trunk: Renderer.segsPath(W, L.roads.trunk),
-      motorway: Renderer.segsPath(W, L.roads.motorway),
-      rail: [],
-      bus: null,
-      bands: null,
-    };
-    for (const mode of MODE_ORDER) {
-      const group = L.railByMode[mode];
-      if (!group) continue;
-      paths.rail.push([mode, group.map(([li, segs]) => [li, Renderer.segsPath(W, segs)])]);
+    let built = false;
+    if (scene.geomVersion !== this.pathKey || !this.paths) {
+      const W = scene.mesh.warped;
+      const L = scene.layers;
+      this.paths = {
+        boroughs: Renderer.polysPath(W, L.boroughs),
+        parks: Renderer.polysPath(W, L.parks),
+        thames: Renderer.polysPath(W, L.thames),
+        water: Renderer.polysPath(W, L.water),
+        thamesLine: Renderer.segsPath(W, L.thamesLine),
+        rail: MODE_ORDER.filter((mode) => L.railByMode[mode])
+          .map((mode) => [mode, L.railByMode[mode].map(([li, segs]) => [li, segs, Renderer.segsPath(W, segs)])]),
+      };
+      this.meshBounds = boundsOf(W, boundsOf(scene.busSegments));
+      this.pathKey = scene.geomVersion;
+      built = true;
     }
-    const seg = scene.busSegments;
-    if (seg && seg.length) {
-      const path = new Path2D();
-      for (let i = 0; i < seg.length; i += 4) {
-        path.moveTo(seg[i], seg[i + 1]);
-        path.lineTo(seg[i + 2], seg[i + 3]);
+    const bandKey = `${scene.bandsVersion}|${scene.geomVersion}`;
+    if (bandKey !== this.bandKey) {
+      const bands = scene.bands;
+      this.bandPaths = null;
+      this.bounds = this.meshBounds;
+      if (bands) {
+        // Bands are only filled, which closes every ring implicitly.
+        this.bandPaths = bands.list.map((band) => {
+          const path = new Path2D();
+          const { rings } = band;
+          for (let r = 0; r < rings.length; r += 2) Renderer.addRing(path, bands.coords, rings[r], rings[r + 1], false);
+          return path;
+        });
+        this.bounds = boundsOf(bands.coords, { ...this.meshBounds });
       }
-      paths.bus = path;
+      this.bandKey = bandKey;
+      built = true;
     }
-    if (scene.bands) {
-      const coords = scene.bands.coords;
-      paths.bands = scene.bands.list.map((band) => {
-        const path = new Path2D();
-        for (const polygon of band.polygons) for (const [s, c] of polygon) Renderer.addRing(path, coords, s, c, true);
-        return path;
-      });
+    if (built) this.stats.pathMs = performance.now() - t0;
+  }
+
+  chunked(name, cell, build) {
+    const key = `${name}|${cell}`;
+    let chunks = this.chunks.get(key);
+    if (!chunks) {
+      chunks = build();
+      this.chunks.set(key, chunks);
     }
-    this.paths = paths;
-    this.pathKey = key;
-    this.stats.pathMs = performance.now() - t0;
+    return chunks;
   }
 
   // ---------------------------------------------------------------- frame
@@ -185,90 +394,23 @@ export class Renderer {
   }
 
   render(scene) {
-    const ctx = this.ctx;
-    const dpr = this.dpr;
-    const { transform: { x: tx, y: ty, k }, lines } = scene;
-    const paths = this.paths;
-    const px = (n) => n / k;
+    const { ctx, dpr } = this;
+    const now = performance.now();
+    const t = scene.transform;
+    if (!this.last || this.last.k !== t.k) this.zoomedAt = now;
+    if (!this.last || this.last.k !== t.k || this.last.x !== t.x || this.last.y !== t.y) this.movedAt = now;
+    this.last = { k: t.k, x: t.x, y: t.y };
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = COLOURS.bg;
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    // Everything on top of the map layer uses the transform the layer was placed with, which can
+    // differ from the frame's by under half a device pixel.
+    const { k, x: tx, y: ty } = this.placeLayer(scene, now);
 
-    ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-
-    ctx.fillStyle = COLOURS.land;
-    ctx.fill(paths.boroughs, 'evenodd');
-
-    // Travel-time bands, clipped to Greater London and painted lowest band first.
-    if (paths.bands) {
-      ctx.save();
-      ctx.clip(paths.boroughs, 'evenodd');
-      scene.bands.list.forEach((band, i) => {
-        ctx.fillStyle = this.tint(band.colour);
-        ctx.fill(paths.bands[i], 'evenodd');
-      });
-      ctx.restore();
+    if (scene.route) {
+      ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      this.drawRoute(ctx, scene, (n) => n / k);
     }
-
-    ctx.strokeStyle = COLOURS.landBorder;
-    ctx.lineWidth = px(1);
-    ctx.stroke(paths.boroughs);
-
-    ctx.globalAlpha = paths.bands ? 0.55 : 1;
-    ctx.fillStyle = COLOURS.park;
-    ctx.fill(paths.parks, 'evenodd');
-    ctx.globalAlpha = 1;
-
-    ctx.strokeStyle = COLOURS.water;
-    ctx.lineWidth = 3.2;
-    ctx.stroke(paths.thamesLine);
-    for (const water of [paths.thames, paths.water]) {
-      ctx.fillStyle = COLOURS.water;
-      ctx.fill(water, 'evenodd');
-      ctx.strokeStyle = COLOURS.waterEdge;
-      ctx.lineWidth = px(0.8);
-      ctx.stroke(water);
-    }
-
-    ctx.strokeStyle = COLOURS.trunk;
-    ctx.lineWidth = px(1.1) + 0.15;
-    ctx.stroke(paths.trunk);
-    ctx.strokeStyle = COLOURS.motorway;
-    ctx.lineWidth = px(1.6) + 0.25;
-    ctx.stroke(paths.motorway);
-
-    if (paths.bus && scene.showBus) {
-      ctx.strokeStyle = COLOURS.busNet;
-      ctx.lineWidth = px(1) + 0.08;
-      ctx.stroke(paths.bus);
-    }
-
-    if (scene.ghost) {
-      ctx.globalAlpha = 0.5;
-      ctx.strokeStyle = 'rgba(255,209,102,0.35)';
-      ctx.lineWidth = px(1);
-      ctx.stroke(paths.ghost);
-      ctx.globalAlpha = 1;
-    }
-
-    // Rail lines, dimmed when their tick box is off.
-    for (const [mode, group] of paths.rail) {
-      const on = !!scene.enabled[GROUP_OF_MODE[mode]];
-      ctx.globalAlpha = on ? (mode === 'national-rail' ? 0.75 : 0.95) : 0.18;
-      ctx.setLineDash(mode === 'national-rail' ? [px(6), px(4)] : []);
-      ctx.lineWidth = px(MODE_WIDTH[mode]) + (on ? 0.12 : 0.05);
-      for (const [lineIdx, path] of group) {
-        ctx.strokeStyle = lines[lineIdx].colour;
-        ctx.stroke(path);
-      }
-    }
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
-
-    if (scene.route) this.drawRoute(ctx, scene, px);
 
     // Screen space from here on.
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -287,6 +429,221 @@ export class Renderer {
     this.drawOriginDot(ctx, ox, oy);
     this.drawLabels(ctx, scene, S, k, ox, oy);
   }
+
+  // ---------------------------------------------------------------- map layer
+
+  // Everything the map layer depends on apart from the transform. Stations and places are drawn on
+  // top of the layer, so showing or hiding them leaves it alone.
+  layerKey(scene) {
+    return [
+      scene.geomVersion, scene.bandsVersion, scene.warped, scene.showBus, scene.ghost,
+      !!scene.enabled.underground, !!scene.enabled.trains, this.dpr,
+    ].join('|');
+  }
+
+  // Copies the map layer onto the canvas, rendering it first if the one held can't be used for this
+  // frame, and returns the transform it was placed with.
+  placeLayer(scene, now) {
+    const { ctx, dpr } = this;
+    const { k, x, y } = scene.transform;
+    const key = this.layerKey(scene);
+    let held = this.held;
+    let place = null;
+    if (held && held.key === key) {
+      if (held.k === k) {
+        // Same scale: move the layer, by whole device pixels.
+        const left = Math.round((held.left + x - held.x) * dpr) / dpr;
+        const top = Math.round((held.top + y - held.y) * dpr) / dpr;
+        const candidate = { scale: 1, left, top, k, x: left - held.left + held.x, y: top - held.top + held.y };
+        if (this.covers(held, candidate, 0)) {
+          place = candidate;
+          // A view that has drifted near the layer's edge gets a fresh layer once it is still.
+          if (!this.covers(held, candidate, held.margin / 2)) {
+            if (now - this.movedAt >= SETTLE_MS) place = null;
+            else this.settleSoon();
+          }
+        }
+      } else if (now - this.zoomedAt < SETTLE_MS) {
+        // Zooming: scale the layer for now, and render it sharp once the zoom rests.
+        const scale = k / held.k;
+        const candidate = { scale, left: (held.left - held.x) * scale + x, top: (held.top - held.y) * scale + y, k, x, y };
+        if (scale >= 0.5 && scale <= 2 && this.covers(held, candidate, 0)) {
+          place = candidate;
+          this.settleSoon();
+        }
+      }
+    }
+    if (!place) {
+      this.renderLayer(scene, key);
+      held = this.held;
+      place = { scale: 1, left: held.left, top: held.top, k, x, y };
+    }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = COLOURS.bg;
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    if (place.scale === 1) {
+      ctx.drawImage(this.layer, 0, 0, held.pw, held.ph, Math.round(place.left * dpr), Math.round(place.top * dpr), held.pw, held.ph);
+    } else {
+      ctx.setTransform(place.scale, 0, 0, place.scale, place.left * dpr, place.top * dpr);
+      ctx.drawImage(this.layer, 0, 0, held.pw, held.ph, 0, 0, held.pw, held.ph);
+    }
+    return place;
+  }
+
+  // Whether the layer, placed as given, covers every part of the window (grown by `extra` pixels on
+  // each side) where the map has anything to show.
+  covers(held, place, extra) {
+    const { k, x, y, scale } = place;
+    const b = this.bounds;
+    const pad = held.pad * scale;
+    const x0 = Math.max(-extra, b.x0 * k + x - pad);
+    const y0 = Math.max(-extra, b.y0 * k + y - pad);
+    const x1 = Math.min(this.w + extra, b.x1 * k + x + pad);
+    const y1 = Math.min(this.h + extra, b.y1 * k + y + pad);
+    if (x1 <= x0 || y1 <= y0) return true;
+    const eps = 1e-6;
+    return x0 >= place.left - eps && y0 >= place.top - eps
+      && x1 <= place.left + held.width * scale + eps && y1 <= place.top + held.height * scale + eps;
+  }
+
+  settleSoon() {
+    if (this.settleTimer) clearTimeout(this.settleTimer);
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = 0;
+      this.frameKey = null;
+      this.onSettle();
+    }, SETTLE_MS + 30);
+  }
+
+  // Renders the map for the current transform over the window plus a margin, cut down to the map.
+  renderLayer(scene, key) {
+    const t0 = performance.now();
+    const { dpr, w, h, layer } = this;
+    const { k, x, y } = scene.transform;
+    const area = Math.min(LAYER_WINDOWS * w * h, LAYER_MAX_PIXELS / (dpr * dpr));
+    const margin = Math.max(0, (Math.sqrt((w + h) ** 2 + 4 * (area - w * h)) - (w + h)) / 4);
+    const pad = 4 + 1.7 * k; // how far strokes can reach past the geometry, in CSS pixels
+    const b = this.bounds;
+    const left = Math.floor(Math.max(-margin, b.x0 * k + x - pad) * dpr) / dpr;
+    const top = Math.floor(Math.max(-margin, b.y0 * k + y - pad) * dpr) / dpr;
+    const pw = Math.max(1, Math.ceil((Math.min(w + margin, b.x1 * k + x + pad) - left) * dpr));
+    const ph = Math.max(1, Math.ceil((Math.min(h + margin, b.y1 * k + y + pad) - top) * dpr));
+
+    // The layer canvas only grows, so that panning and zooming don't keep reallocating it, unless it
+    // would pass the pixel limit or has become far bigger than needed. The part in use is cleared and
+    // clipped to.
+    if (pw > layer.width || ph > layer.height || 4 * pw * ph < layer.width * layer.height) {
+      const width = Math.max(pw, layer.width);
+      const height = Math.max(ph, layer.height);
+      const exact = 4 * pw * ph < layer.width * layer.height || width * height > LAYER_MAX_PIXELS;
+      layer.width = exact ? pw : width;
+      layer.height = exact ? ph : height;
+    }
+    const c = this.layerCtx;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.fillStyle = COLOURS.bg;
+    c.fillRect(0, 0, pw, ph);
+    c.save();
+    if (pw < layer.width || ph < layer.height) {
+      c.beginPath();
+      c.rect(0, 0, pw, ph);
+      c.clip();
+    }
+    c.setTransform(dpr * k, 0, 0, dpr * k, dpr * (x - left), dpr * (y - top));
+    const region = { x0: (left - x) / k, y0: (top - y) / k, x1: (left + pw / dpr - x) / k, y1: (top + ph / dpr - y) / k };
+    this.drawMap(c, scene, k, region);
+    c.restore();
+
+    this.held = { key, k, x, y, left, top, width: pw / dpr, height: ph / dpr, pw, ph, pad, margin };
+    this.stats.layerMs = performance.now() - t0;
+    this.stats.layerDraws++;
+  }
+
+  drawMap(ctx, scene, k, region) {
+    const { paths, dpr } = this;
+    const px = (n) => n / k;
+    const cell = chunkCell(k, dpr);
+    const base = scene.mesh.base;
+    const coords = scene.mesh.warped; // the same as base unless the map is stretched
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    ctx.fillStyle = COLOURS.land;
+    ctx.fill(paths.boroughs, 'evenodd');
+
+    // Travel-time bands, clipped to Greater London and painted lowest band first.
+    if (this.bandPaths) {
+      ctx.save();
+      ctx.clip(paths.boroughs, 'evenodd');
+      scene.bands.list.forEach((band, i) => {
+        ctx.fillStyle = this.tint(band.colour);
+        ctx.fill(this.bandPaths[i], 'evenodd');
+      });
+      ctx.restore();
+    }
+
+    ctx.strokeStyle = COLOURS.landBorder;
+    ctx.lineWidth = px(1);
+    ctx.stroke(paths.boroughs);
+
+    ctx.globalAlpha = this.bandPaths ? 0.55 : 1;
+    ctx.fillStyle = COLOURS.park;
+    ctx.fill(paths.parks, 'evenodd');
+    ctx.globalAlpha = 1;
+
+    ctx.strokeStyle = COLOURS.water;
+    ctx.lineWidth = 3.2;
+    ctx.stroke(paths.thamesLine);
+    for (const water of [paths.thames, paths.water]) {
+      ctx.fillStyle = COLOURS.water;
+      ctx.fill(water, 'evenodd');
+      ctx.strokeStyle = COLOURS.waterEdge;
+      ctx.lineWidth = px(0.8);
+      ctx.stroke(water);
+    }
+
+    // Road chunks of the unstretched map are kept for each zoom level; stretched roads move with
+    // every change, so their chunks are cut afresh.
+    for (const [road, colour, width] of [['trunk', COLOURS.trunk, px(1.1) + 0.15], ['motorway', COLOURS.motorway, px(1.6) + 0.25]]) {
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = width;
+      const runs = scene.layers.roads[road];
+      const chunks = scene.warped ? polylineChunks(coords, runs, cell) : this.chunked(road, cell, () => polylineChunks(base, runs, cell));
+      strokeVisible(ctx, chunks, region, width);
+    }
+
+    if (scene.showBus && scene.busSegments.length) {
+      ctx.strokeStyle = COLOURS.busNet;
+      ctx.lineWidth = px(1) + 0.08;
+      strokeVisible(ctx, this.chunked('bus', cell, () => segmentChunks(scene.busSegments, cell)), region, ctx.lineWidth);
+    }
+
+    if (scene.ghost) {
+      if (!this.ghost) this.ghost = Renderer.polysPath(base, scene.layers.boroughs);
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = 'rgba(255,209,102,0.35)';
+      ctx.lineWidth = px(1);
+      ctx.stroke(this.ghost);
+      ctx.globalAlpha = 1;
+    }
+
+    // Rail lines, dimmed when their tick box is off. National Rail is dashed.
+    for (const [mode, group] of paths.rail) {
+      const on = !!scene.enabled[GROUP_OF_MODE[mode]];
+      const dashed = mode === 'national-rail';
+      ctx.globalAlpha = on ? (dashed ? 0.75 : 0.95) : 0.18;
+      ctx.lineWidth = px(MODE_WIDTH[mode]) + (on ? 0.12 : 0.05);
+      for (const [lineIdx, segs, path] of group) {
+        ctx.strokeStyle = scene.lines[lineIdx].colour;
+        if (!dashed) ctx.stroke(path);
+        else for (const dashes of dashChunks(coords, segs, px(6), px(4), cell, region, ctx.lineWidth)) ctx.stroke(dashes);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------- on top of the map
 
   drawRoute(ctx, scene, px) {
     ctx.save();
@@ -358,23 +715,27 @@ export class Renderer {
     ctx.restore();
   }
 
-  // Stations and places, batched into one path per fill/stroke combination.
+  // Stations and places: one path per fill/stroke combination and screen cell, so that each path
+  // stays small enough to rasterise quickly. Styles are painted in the order they first appear.
   drawNodes(ctx, scene, S, k) {
     const { nodes, times } = scene;
     const w = this.w;
     const h = this.h;
     const margin = 10;
-    const buckets = this.nodeBuckets;
-    buckets.clear();
+    const styles = this.nodeStyles;
+    styles.clear();
     const add = (fill, stroke, r, x, y) => {
       const key = `${fill}|${stroke}|${r}`;
-      let bucket = buckets.get(key);
-      if (!bucket) {
-        bucket = { fill, stroke, path: new Path2D() };
-        buckets.set(key, bucket);
+      let style = styles.get(key);
+      if (!style) {
+        style = { fill, stroke, cells: new Map() };
+        styles.set(key, style);
       }
-      bucket.path.moveTo(x + r, y);
-      bucket.path.arc(x, y, r, 0, TAU);
+      const cell = cellKey(x, y, NODE_CELL_PX);
+      let path = style.cells.get(cell);
+      if (!path) style.cells.set(cell, (path = new Path2D()));
+      path.moveTo(x + r, y);
+      path.arc(x, y, r, 0, TAU);
     };
     const stationR = k < 1.5 ? 1.7 : 2.2;
     for (let i = 0; i < nodes.length; i++) {
@@ -398,13 +759,13 @@ export class Renderer {
           unreachable ? 'rgba(255,255,255,0.4)' : '#ffffff', r, x, y);
       }
     }
-    for (const bucket of buckets.values()) {
-      ctx.fillStyle = bucket.fill;
-      ctx.fill(bucket.path);
-      if (bucket.stroke) {
-        ctx.strokeStyle = bucket.stroke;
+    for (const style of styles.values()) {
+      ctx.fillStyle = style.fill;
+      for (const path of style.cells.values()) ctx.fill(path);
+      if (style.stroke) {
+        ctx.strokeStyle = style.stroke;
         ctx.lineWidth = 1.2;
-        ctx.stroke(bucket.path);
+        for (const path of style.cells.values()) ctx.stroke(path);
       }
     }
     if (scene.hover >= 0) {

@@ -18,34 +18,30 @@ export const LEG = { WALK: 1, BOARD: 2, ALIGHT: 3, RIDE: 4 };
 const OFFSETS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
 
 export class Engine {
+  // transit: as returned by unpackTransit (see transit.js).
   constructor(transit, grid) {
     this.grid = grid;
     this.lines = transit.lines;
     const C = (this.C = grid.count);
+    const { stopLat, stopLon, platformStop, platformLine, rideFrom, rideTo, rideMetres } = transit;
 
-    const S = transit.stops.length;
-    this.stopLat = new Float64Array(S);
-    this.stopLon = new Float64Array(S);
+    const S = stopLat.length;
+    this.stopLat = stopLat;
+    this.stopLon = stopLon;
     this.stopCell = new Int32Array(S);
     const stopRc = new Float64Array(S);
     for (let s = 0; s < S; s++) {
-      const [lat, lon] = transit.stops[s];
-      this.stopLat[s] = lat;
-      this.stopLon[s] = lon;
-      this.stopCell[s] = grid.nearestWalkable(grid.cellOf(lon, lat));
-      const [x, y] = toMetres(lon, lat);
+      this.stopCell[s] = grid.nearestWalkable(grid.cellOf(stopLon[s], stopLat[s]));
+      const [x, y] = toMetres(stopLon[s], stopLat[s]);
       stopRc[s] = Math.hypot(x, y);
     }
 
-    const P = (this.P = transit.platforms.length);
-    this.platformStop = new Int32Array(P);
-    this.platformLine = new Int16Array(P);
+    const P = (this.P = platformStop.length);
+    this.platformStop = platformStop;
+    this.platformLine = platformLine;
     const perCell = new Int32Array(C + 1);
     for (let p = 0; p < P; p++) {
-      const [stop, line] = transit.platforms[p];
-      this.platformStop[p] = stop;
-      this.platformLine[p] = line;
-      const cell = this.stopCell[stop];
+      const cell = this.stopCell[platformStop[p]];
       if (cell >= 0) perCell[cell + 1]++;
     }
     for (let c = 0; c < C; c++) perCell[c + 1] += perCell[c];
@@ -57,20 +53,40 @@ export class Engine {
       if (cell >= 0) this.cellPlatforms[fill[cell]++] = p;
     }
 
-    const R = transit.rides.length;
+    const R = rideFrom.length;
     const perPlatform = new Int32Array(P + 1);
-    for (const [from] of transit.rides) perPlatform[from + 1]++;
+    for (let r = 0; r < R; r++) perPlatform[rideFrom[r] + 1]++;
     for (let p = 0; p < P; p++) perPlatform[p + 1] += perPlatform[p];
     this.rideStart = perPlatform;
     this.rideTo = new Int32Array(R);
     this.rideT = new Float32Array(R);
     const rfill = perPlatform.slice(0, P);
-    for (const [from, to, metres] of transit.rides) {
+    for (let r = 0; r < R; r++) {
+      const from = rideFrom[r];
+      const to = rideTo[r];
       const k = rfill[from]++;
       this.rideTo[k] = to;
-      const mode = this.lines[this.platformLine[from]].mode;
-      this.rideT[k] = hopMinutes(mode, metres, (stopRc[this.platformStop[from]] + stopRc[this.platformStop[to]]) / 2);
+      const mode = this.lines[platformLine[from]].mode;
+      this.rideT[k] = hopMinutes(mode, rideMetres[r], (stopRc[platformStop[from]] + stopRc[platformStop[to]]) / 2);
     }
+
+    // The walkable neighbours of every cell as a bitmask in OFFSETS order, with the bounds, the
+    // water mask and the no-squeezing rule for diagonals already applied. The search then tests one
+    // bit per neighbour and visits them in the same order as before, so its results are unchanged.
+    const { cols, rows, mask } = grid;
+    const neighbours = (this.neighbours = new Uint8Array(C));
+    for (let j = 0, u = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++, u++) {
+        const east = i + 1 < cols && mask[u + 1];
+        const west = i > 0 && mask[u - 1];
+        const south = j + 1 < rows && mask[u + cols];
+        const north = j > 0 && mask[u - cols];
+        neighbours[u] = (east ? 1 : 0) | (west ? 2 : 0) | (south ? 4 : 0) | (north ? 8 : 0)
+          | (east && south && mask[u + cols + 1] ? 16 : 0) | (east && north && mask[u - cols + 1] ? 32 : 0)
+          | (west && south && mask[u + cols - 1] ? 64 : 0) | (west && north && mask[u - cols - 1] ? 128 : 0);
+      }
+    }
+    this.neighbourStep = Int32Array.from(OFFSETS, ([di, dj]) => di + dj * cols);
 
     this.size = C + P;
     this.dist = new Float64Array(this.size);
@@ -78,13 +94,14 @@ export class Engine {
     this.prev = new Int32Array(this.size);
     this.via = new Int8Array(this.size);
     this.viaLine = new Int16Array(this.size);
+    this.heap = new Heap(Math.max(4096, C >> 2));
     this.stepMinutes = walkStepMinutes(grid.cell);
   }
 
   // Shortest times from a grid cell. Returns typed arrays owned by the engine (valid until the next call).
   route(originCell, enabled) {
-    const { grid, C, dist, walked, prev, via, viaLine, lines } = this;
-    const { cols, rows, mask } = grid;
+    const { grid, C, dist, walked, prev, via, viaLine, lines, heap, neighbours, neighbourStep } = this;
+    const { mask } = grid;
     const cap = enabled.foot ? Infinity : WALK.accessLimit;
     const groupOn = lines.map((l) => !!enabled[GROUP_OF_MODE[l.mode]]);
     const lineWait = lines.map((l) => l.wait + PLATFORM_ACCESS);
@@ -93,7 +110,7 @@ export class Engine {
     prev.fill(-1);
     via.fill(0);
     viaLine.fill(-1);
-    const heap = new Heap(Math.max(4096, C >> 2));
+    heap.size = 0;
     if (originCell < 0 || !mask[originCell]) return { dist, prev, via, viaLine, originCell, enabled };
     dist[originCell] = 0;
     walked[originCell] = 0;
@@ -108,20 +125,12 @@ export class Engine {
       const t = heap.lastKey;
       if (t > dist[u]) continue;
       if (u < C) {
-        const i = u % cols;
-        const j = (u - i) / cols;
+        const bits = neighbours[u];
         const w = walked[u];
         for (let k = 0; k < 8; k++) {
-          const di = OFFSETS[k][0];
-          const dj = OFFSETS[k][1];
-          const ni = i + di;
-          const nj = j + dj;
-          if (ni < 0 || nj < 0 || ni >= cols || nj >= rows) continue;
-          const v = nj * cols + ni;
-          if (!mask[v]) continue;
-          const diagonal = k >= 4;
-          if (diagonal && (!mask[u + di] || !mask[u + dj * cols])) continue;
-          const s = diagonal ? diag : step;
+          if (!(bits & (1 << k))) continue;
+          const v = u + neighbourStep[k];
+          const s = k >= 4 ? diag : step;
           const nw = w + s;
           if (nw > cap) continue;
           const nt = t + s;
