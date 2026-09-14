@@ -84,7 +84,8 @@ graphics card. These rules keep it cheap:
   scales the copy, and the layer is rendered sharp again once the zoom has been still for 150 ms.
   Everything drawn over the colour bands is kept in a transparent overlay as well, so a new start
   point or tick box repaints only the land and the bands beneath it. A pan that runs past the margin
-  moves the pixels the layer already has and renders only the strip it uncovered.
+  moves the pixels the layer already has and renders only the strip it uncovered, and a fresh layer
+  renders the part in the window first and its margin over the following frames.
 - **Paths stay small.** Chrome rasterises a stroked path that spans the screen many times more slowly
   than the same lines cut into pieces a hundred or so pixels across, so the bus network and the roads
   are drawn in chunks sized to the zoom level and chunks out of view are skipped. National Rail

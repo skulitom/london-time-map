@@ -49,6 +49,7 @@ const MODE_WIDTH = { tube: 2.4, dlr: 2, 'elizabeth-line': 2.4, overground: 2, tr
 const CHUNK_PX = 128;           // target size of a chunk of lines, in device pixels
 const NODE_CELL_PX = 128;       // station and place markers are batched per cell of this many pixels
 const SETTLE_MS = 150;          // a scaled layer is rendered sharp once the zoom has been still this long
+const VIEW_PAD = 32;            // CSS pixels of margin rendered with the window's part of a fresh layer
 const LAYER_WINDOWS = 2;        // the map layer (and its overlay) covers at most this many windows' worth of pixels...
 const LAYER_MAX_PIXELS = 16e6;  // ...and never more than iOS Safari allows one canvas
 
@@ -229,8 +230,9 @@ function boundsOf(coords, bounds = { x0: Infinity, y0: Infinity, x1: -Infinity, 
 // ---------------------------------------------------------------- renderer
 
 export class Renderer {
-  // onSettle is called when a frame should be drawn again although nothing in the scene changed:
-  // the zoom has come to rest and the scaled map layer can now be rendered sharp.
+  // onSettle is called when a frame should be drawn again although nothing in the scene changed: the
+  // zoom has come to rest and the scaled map layer can now be rendered sharp, or part of the layer's
+  // margin is still to render.
   constructor(canvas, { onSettle = () => {} } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: false });
@@ -248,6 +250,7 @@ export class Renderer {
     this.last = null;
     this.zoomedAt = -Infinity;
     this.movedAt = -Infinity;
+    this.reshapedAt = -Infinity;
     this.dpr = 1;
     this.w = 0;
     this.h = 0;
@@ -263,7 +266,7 @@ export class Renderer {
     this.nodeStyles = new Map();
     this.textWidths = new Map();
     this.tintCache = new Map();
-    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, scrollMs: 0, draws: 0, layerDraws: 0, scrolls: 0, skipped: 0 };
+    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, scrollMs: 0, draws: 0, layerDraws: 0, scrolls: 0, parts: 0, skipped: 0 };
   }
 
   // Setting a canvas's size clears it, even to the same size, so that only happens on a real change.
@@ -405,6 +408,13 @@ export class Renderer {
     this.ensurePaths(scene);
     this.render(scene);
     this.frameKey = key;
+    // Part of the map layer's margin is still to render: carry on next frame, or, while the map is
+    // being stretched and each frame lays out a new layer anyway, once it stops.
+    if (this.held && this.held.pending.length) {
+      this.frameKey = null;
+      if (performance.now() - this.reshapedAt < SETTLE_MS) this.settleSoon();
+      else this.onSettle();
+    }
     this.stats.drawMs = performance.now() - t0;
     this.stats.draws++;
     return true;
@@ -416,7 +426,8 @@ export class Renderer {
     const t = scene.transform;
     if (!this.last || this.last.k !== t.k) this.zoomedAt = now;
     if (!this.last || this.last.k !== t.k || this.last.x !== t.x || this.last.y !== t.y) this.movedAt = now;
-    this.last = { k: t.k, x: t.x, y: t.y };
+    if (!this.last || this.last.geomVersion !== scene.geomVersion) this.reshapedAt = now;
+    this.last = { k: t.k, x: t.x, y: t.y, geomVersion: scene.geomVersion };
 
     // Everything on top of the map layer uses the transform the layer was placed with, which can
     // differ from the frame's by under half a device pixel.
@@ -474,11 +485,11 @@ export class Renderer {
     const bandsKey = this.bandsKey(scene);
     const overlayKey = this.overlayKey(scene);
     let held = this.held && this.held.overlayKey === overlayKey ? this.held : null;
-    let place = held && this.reuse(held, scene.transform, now);
+    let place = held && this.reuse(held, scene, now);
     // Panned past the layer, or resting near its edge: keep what is there and render only the rest.
     if (!place && held && held.k === k && held.bandsKey === bandsKey && this.scroll(scene)) {
       held = this.held;
-      place = this.reuse(held, scene.transform, now);
+      place = this.reuse(held, scene, now);
     }
     if (!place) {
       this.renderLayer(scene, bandsKey, overlayKey);
@@ -486,6 +497,8 @@ export class Renderer {
       place = { scale: 1, left: held.left, top: held.top, k, x, y };
     } else if (held.bandsKey !== bandsKey) {
       this.paintBands(scene, bandsKey);
+    } else if (held.pending.length && now - this.reshapedAt >= SETTLE_MS) {
+      this.renderPending(scene);
     }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -500,17 +513,18 @@ export class Renderer {
     return place;
   }
 
-  // Where to put the layer held for a frame with this transform, or null if it has to be rendered again.
-  reuse(held, { k, x, y }, now) {
+  // Where to put the layer held for this frame, or null if it has to be rendered again.
+  reuse(held, scene, now) {
     const { dpr } = this;
+    const { k, x, y } = scene.transform;
     if (held.k === k) {
       // Same scale: move the layer, by whole device pixels.
       const left = Math.round((held.left + x - held.x) * dpr) / dpr;
       const top = Math.round((held.top + y - held.y) * dpr) / dpr;
       const place = { scale: 1, left, top, k, x: left - held.left + held.x, y: top - held.top + held.y };
-      if (!this.covers(held, place, 0)) return null;
+      if (!this.showable(held, place, scene)) return null;
       // A view that has drifted near the layer's edge gets a fresh layer once it is still.
-      if (!this.covers(held, place, held.margin / 2)) {
+      if (!this.covers(held, place, held.margin / 2, true)) {
         if (now - this.movedAt >= SETTLE_MS) return null;
         this.settleSoon();
       }
@@ -520,15 +534,25 @@ export class Renderer {
     // Zooming: scale the layer for now, and render it sharp once the zoom rests.
     const scale = k / held.k;
     const place = { scale, left: (held.left - held.x) * scale + x, top: (held.top - held.y) * scale + y, k, x, y };
-    if (scale < 0.5 || scale > 2 || !this.covers(held, place, 0)) return null;
+    if (scale < 0.5 || scale > 2 || !this.showable(held, place, scene)) return null;
     this.settleSoon();
     return place;
   }
 
+  // Whether the layer, placed as given, can be shown: when the view reaches into margin not rendered
+  // yet, as much of it is rendered as the view needs.
+  showable(held, place, scene) {
+    if (this.covers(held, place, 0, false)) return true;
+    if (!this.covers(held, place, 0, true)) return false;
+    while (held.pending.length && !this.covers(held, place, 0, false)) this.renderPending(scene);
+    return this.covers(held, place, 0, false);
+  }
+
   // Whether the layer, placed as given, covers every part of the window (grown by `extra` pixels on
-  // each side) where the map has anything to show.
-  covers(held, place, extra) {
+  // each side) where the map has anything to show: with its rendered part, or with all of it.
+  covers(held, place, extra, whole) {
     const { k, x, y, scale } = place;
+    const { dpr } = this;
     const b = this.bounds;
     const pad = held.pad * scale;
     const x0 = Math.max(-extra, b.x0 * k + x - pad);
@@ -536,9 +560,10 @@ export class Renderer {
     const x1 = Math.min(this.w + extra, b.x1 * k + x + pad);
     const y1 = Math.min(this.h + extra, b.y1 * k + y + pad);
     if (x1 <= x0 || y1 <= y0) return true;
+    const [vx0, vy0, vx1, vy1] = whole ? [0, 0, held.pw, held.ph] : held.valid;
     const eps = 1e-6;
-    return x0 >= place.left - eps && y0 >= place.top - eps
-      && x1 <= place.left + held.width * scale + eps && y1 <= place.top + held.height * scale + eps;
+    return x0 >= place.left + (vx0 / dpr) * scale - eps && y0 >= place.top + (vy0 / dpr) * scale - eps
+      && x1 <= place.left + (vx1 / dpr) * scale + eps && y1 <= place.top + (vy1 / dpr) * scale + eps;
   }
 
   settleSoon() {
@@ -566,15 +591,49 @@ export class Renderer {
   }
 
   // Renders the map for the current transform over the window plus a margin, cut down to the map.
+  // Only the part in the window is rendered straight away; the margin around it follows a strip a
+  // frame, so zooming in or out doesn't pay for the margin in the frame it lands.
   renderLayer(scene, bandsKey, overlayKey) {
     const t0 = performance.now();
+    const { dpr } = this;
     const { k, x, y } = scene.transform;
-    this.held = { ...this.layout(k, x, y), bandsKey, overlayKey };
-    fit(this.layer, this.held.pw, this.held.ph);
-    fit(this.overlay, this.held.pw, this.held.ph);
-    this.renderPart(scene, 0, 0, this.held.pw, this.held.ph);
+    const held = (this.held = { ...this.layout(k, x, y), bandsKey, overlayKey });
+    fit(this.layer, held.pw, held.ph);
+    fit(this.overlay, held.pw, held.ph);
+    for (const [ctx, opaque] of [[this.layerCtx, true], [this.overlayCtx, false]]) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = COLOURS.bg;
+      if (opaque) ctx.fillRect(0, 0, held.pw, held.ph);
+      else ctx.clearRect(0, 0, held.pw, held.ph);
+    }
+    const pad = VIEW_PAD * dpr;
+    let x0 = Math.max(0, Math.floor(-held.left * dpr - pad));
+    let y0 = Math.max(0, Math.floor(-held.top * dpr - pad));
+    let x1 = Math.min(held.pw, Math.ceil((this.w - held.left) * dpr + pad));
+    let y1 = Math.min(held.ph, Math.ceil((this.h - held.top) * dpr + pad));
+    if (x1 <= x0 || y1 <= y0) [x0, y0, x1, y1] = [0, 0, held.pw, held.ph];
+    this.startParts(held, x0, y0, x1, y1);
+    this.renderPart(scene, x0, y0, x1, y1);
     this.stats.layerMs = performance.now() - t0;
     this.stats.layerDraws++;
+  }
+
+  // Records that a rectangle of the layer is rendered (or about to be), and queues the four strips
+  // around it. Left and right come before top and bottom, so what is rendered stays a rectangle.
+  startParts(held, x0, y0, x1, y1) {
+    held.valid = [x0, y0, x1, y1];
+    held.pending = [[0, y0, x0, y1], [x1, y0, held.pw, y1], [0, 0, held.pw, y0], [0, y1, held.pw, held.ph]]
+      .filter(([a, b, c, d]) => c > a && d > b);
+  }
+
+  // Renders the next strip of the layer's margin.
+  renderPending(scene) {
+    const held = this.held;
+    const [x0, y0, x1, y1] = held.pending.shift();
+    this.renderPart(scene, x0, y0, x1, y1);
+    const v = held.valid;
+    held.valid = [Math.min(v[0], x0), Math.min(v[1], y0), Math.max(v[2], x1), Math.max(v[3], y1)];
+    this.stats.parts++;
   }
 
   // Lays the layer out afresh for the current view at the same scale, moving the pixels it already
@@ -590,13 +649,14 @@ export class Renderer {
     const dx = Math.round((old.left + x - old.x) * dpr);
     const dy = Math.round((old.top + y - old.y) * dpr);
     const held = { ...this.layout(k, dx / dpr - old.left + old.x, dy / dpr - old.top + old.y), bandsKey: old.bandsKey, overlayKey: old.overlayKey };
-    // Pixel (i, j) of the old layer becomes pixel (i + sx, j + sy) of the new one.
+    // Pixel (i, j) of the old layer becomes pixel (i + sx, j + sy) of the new one. Only the part it
+    // has rendered is worth keeping.
     const sx = dx - Math.round(held.left * dpr);
     const sy = dy - Math.round(held.top * dpr);
-    const x0 = Math.max(0, sx);
-    const y0 = Math.max(0, sy);
-    const x1 = Math.min(held.pw, old.pw + sx);
-    const y1 = Math.min(held.ph, old.ph + sy);
+    const x0 = Math.max(0, old.valid[0] + sx);
+    const y0 = Math.max(0, old.valid[1] + sy);
+    const x1 = Math.min(held.pw, old.valid[2] + sx);
+    const y1 = Math.min(held.ph, old.valid[3] + sy);
     if (x1 <= x0 || y1 <= y0) return false;
     // Moving within the canvases copies each onto itself. Resizing a canvas clears it, so when the new
     // layout needs more room the pixels are copied into larger canvases instead.
@@ -617,8 +677,13 @@ export class Renderer {
       ctx.drawImage(from, x0 - sx, y0 - sy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
     }
     this.held = held;
-    for (const [a, b, c, d] of [[0, 0, held.pw, y0], [0, y1, held.pw, held.ph], [0, y0, x0, y1], [x1, y0, held.pw, y1]]) {
-      if (c > a && d > b) this.renderPart(scene, a, b, c, d);
+    // The strips around what was kept are rendered as the view needs them, and the rest a frame at a
+    // time. Until then they hold only the background.
+    this.startParts(held, x0, y0, x1, y1);
+    for (const [a, b, c, d] of held.pending) {
+      this.layerCtx.fillStyle = COLOURS.bg;
+      this.layerCtx.fillRect(a, b, c - a, d - b);
+      this.overlayCtx.clearRect(a, b, c - a, d - b);
     }
     this.stats.scrollMs = performance.now() - t0;
     this.stats.scrolls++;
@@ -642,10 +707,12 @@ export class Renderer {
     this.paintPart(scene, x0, y0, x1, y1);
   }
 
-  // Paints the land and colour bands into the whole layer at the transform it holds.
+  // Paints the land and colour bands into the rendered part of the layer, at the transform it holds.
+  // Strips still to come are rendered with the new bands anyway.
   paintBands(scene, bandsKey) {
     const t0 = performance.now();
-    this.paintPart(scene, 0, 0, this.held.pw, this.held.ph);
+    const [x0, y0, x1, y1] = this.held.valid;
+    this.paintPart(scene, x0, y0, x1, y1);
     this.held.bandsKey = bandsKey;
     this.stats.bandsMs = performance.now() - t0;
   }
