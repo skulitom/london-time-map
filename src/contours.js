@@ -42,13 +42,16 @@ export function contourBands(values, dx, dy, thresholds) {
     scratch = {
       dx, dy,
       band: new Uint8Array(W * (dy + 2)),
+      mixed: new Int32Array(blockCount),
+      mixedLow: new Uint8Array(blockCount),
+      mixedHigh: new Uint8Array(blockCount),
       next: new Int32Array(pointCount),
       seen: new Uint32Array(pointCount),
       starts: new Int32Array(2 * blockCount),
       stamp: 0,
     };
   }
-  const { band, next, seen, starts } = scratch;
+  const { band, mixed, mixedLow, mixedHigh, next, seen, starts } = scratch;
 
   // How many thresholds each cell reaches, with a border of cells that reach none.
   const T = thresholds.length;
@@ -61,32 +64,41 @@ export function contourBands(values, dx, dy, thresholds) {
     }
   }
 
+  // Squares of four cells whose cells don't all reach the same number of thresholds, in row order,
+  // with the range of thresholds each one crosses. No other square has a contour through it.
+  let mixedCount = 0;
+  for (let p = 0; p < (dy + 1) * W; p++) {
+    if (p % W === dx + 1) continue; // the last cell of a row starts no square
+    const a = band[p];
+    const b = band[p + 1];
+    const c = band[p + W];
+    const d = band[p + W + 1];
+    const low = Math.min(a, b, c, d);
+    const high = Math.max(a, b, c, d);
+    if (low === high) continue;
+    mixed[mixedCount] = p;
+    mixedLow[mixedCount] = low;
+    mixedHigh[mixedCount++] = high;
+  }
+
   let coords = new Float64Array(1 << 16);
   let at = 0; // vertices written
   const bands = [];
   for (let k = 0; k < T; k++) {
     const value = thresholds[k];
     let segments = 0;
-    for (let by = 0; by <= dy; by++) {
-      const top = by * W;
-      const bottom = top + W;
-      let tl = band[top] > k;
-      let bl = band[bottom] > k;
-      for (let bx = 0; bx <= dx; bx++) {
-        const tr = band[top + bx + 1] > k;
-        const br = band[bottom + bx + 1] > k;
-        const code = (bl ? 1 : 0) | (br ? 2 : 0) | (tr ? 4 : 0) | (tl ? 8 : 0);
-        tl = tr;
-        bl = br;
-        if (code === 0 || code === 15) continue;
-        const list = CASES[code];
-        const ox = 2 * bx - 2;
-        const oy = (2 * by - 2) * S;
-        for (let i = 0; i < list.length; i += 4) {
-          const from = ox + list[i] + oy + list[i + 1] * S;
-          next[from] = ox + list[i + 2] + oy + list[i + 3] * S;
-          starts[segments++] = from;
-        }
+    for (let m = 0; m < mixedCount; m++) {
+      if (k < mixedLow[m] || k >= mixedHigh[m]) continue;
+      const p = mixed[m];
+      const code = (band[p + W] > k ? 1 : 0) | (band[p + W + 1] > k ? 2 : 0) | (band[p + 1] > k ? 4 : 0) | (band[p] > k ? 8 : 0);
+      const bx = p % W;
+      const list = CASES[code];
+      const ox = 2 * bx - 2;
+      const oy = (2 * ((p - bx) / W) - 2) * S;
+      for (let i = 0; i < list.length; i += 4) {
+        const from = ox + list[i] + oy + list[i + 1] * S;
+        next[from] = ox + list[i + 2] + oy + list[i + 3] * S;
+        starts[segments++] = from;
       }
     }
 

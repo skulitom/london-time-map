@@ -98,8 +98,9 @@ the fixed overhead plus the straight line at top speed, and any place already re
 another mode skips the integral. That is an exact shortcut, not an approximation.
 
 Loading follows the same idea. `index.html` preloads the data files and the modules, so they
-download alongside D3 instead of after it, and the bulky tables in `data/transit.json` are stored
-as delta-encoded columns, which download at about a third of the size and parse in half the time.
+download alongside D3 instead of after it, and the bulk of `data/transit.json` and `data/base.json`
+(stops, platforms, hops and every coordinate) is stored as delta-encoded integers (`src/data.js`),
+which cuts the two from 718 KB to 286 KB gzipped and makes them quicker to parse.
 
 ## Data
 
@@ -115,9 +116,9 @@ minutes.
 
 | File | Contents | Source |
 | --- | --- | --- |
-| `data/transit.json` | Lines, stops, stations, platforms and stop-to-stop hops for rail and every bus route; rail route geometry. Stops, platforms and hops are stored as delta-encoded columns (`src/transit.js`) | [TfL Unified API](https://api.tfl.gov.uk) |
+| `data/transit.json` | Lines, stops, stations, platforms and stop-to-stop hops for rail and every bus route; rail route geometry. Stops, platforms and hops are stored as delta-encoded columns (`src/data.js`) | [TfL Unified API](https://api.tfl.gov.uk) |
 | `data/walkgrid.json` | Walkable-cell mask (water minus bridges and foot tunnels) and a Greater London mask, bit-packed | OpenStreetMap water areas and bridges, ONS boundaries |
-| `data/base.json` | Borough boundaries, River Thames, other water bodies, major parks, motorways and trunk roads | [ONS Open Geography Portal](https://geoportal.statistics.gov.uk), [OpenStreetMap](https://www.openstreetmap.org/copyright) via Overpass |
+| `data/base.json` | Borough boundaries, River Thames, other water bodies, major parks, motorways and trunk roads, as delta-encoded runs of points (`src/data.js`) | [ONS Open Geography Portal](https://geoportal.statistics.gov.uk), [OpenStreetMap](https://www.openstreetmap.org/copyright) via Overpass |
 | `data/places.json` | About 120 landmarks and town centres with label priority | `scripts/places.json`, hand-curated |
 
 Contains OS data © Crown copyright and database right; ONS boundaries are licensed under the
