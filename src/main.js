@@ -5,7 +5,7 @@ import { WalkGrid } from './walkgrid.js';
 import { Warp } from './warp.js';
 import { Renderer, COLOURS, blend } from './render.js';
 import { contourBands } from './contours.js';
-import { unpackTransit } from './transit.js';
+import { unpackTransit, unpackRuns } from './data.js';
 import { MODES, BANDS, BAND_THRESHOLDS, UNREACHABLE_COLOUR, CENTRE, carMinutes, carFloorMinutes, CAR_MINUTES_PER_METRE, CAR } from './model.js';
 
 const DEFAULT_ORIGIN = { lat: 51.508, lon: -0.1281, name: 'Trafalgar Square', node: -1 };
@@ -137,6 +137,8 @@ async function main() {
   const [bx1, by1] = proj(e, s);
   const baseBounds = { x0: bx0, y0: by0, x1: bx1, y1: by1 };
 
+  // Every ring and line of the map goes into one interleaved list of projected points; layers hold
+  // [first point, count] runs into it.
   const meshList = [];
   const addRing = (coords) => {
     const start = meshList.length / 2;
@@ -146,13 +148,26 @@ async function main() {
     }
     return [start, coords.length];
   };
+  const addRuns = (packed) => {
+    const { counts, coords } = unpackRuns(packed);
+    const runs = [];
+    for (let run = 0, k = 0; run < counts.length; run++) {
+      const start = meshList.length / 2;
+      for (let i = 0; i < counts[run]; i++, k += 2) {
+        const [x, y] = proj(coords[k], coords[k + 1]);
+        meshList.push(x, y);
+      }
+      runs.push([start, counts[run]]);
+    }
+    return runs;
+  };
   const layers = {
-    boroughs: base.boroughs.flatMap((b) => b.polygons.map((rings) => ({ name: b.name, rings: rings.map(addRing) }))),
-    parks: base.parks.map((p) => ({ rings: p.rings.map(addRing) })),
-    thames: base.thames.polygons.map((rings) => ({ rings: rings.map(addRing) })),
-    water: (base.water || []).map((rings) => ({ rings: rings.map(addRing) })),
-    thamesLine: base.thames.centreline.map(addRing),
-    roads: { motorway: base.roads.motorway.map(addRing), trunk: base.roads.trunk.map(addRing) },
+    boroughs: base.boroughs.flatMap((b) => b.polygons.map((rings) => ({ name: b.name, rings: addRuns(rings) }))),
+    parks: base.parks.map((p) => ({ rings: addRuns(p.rings) })),
+    thames: base.thames.polygons.map((rings) => ({ rings: addRuns(rings) })),
+    water: (base.water || []).map((rings) => ({ rings: addRuns(rings) })),
+    thamesLine: addRuns(base.thames.centreline),
+    roads: { motorway: addRuns(base.roads.motorway), trunk: addRuns(base.roads.trunk) },
     railByMode: {},
   };
   transit.lines.forEach((line, li) => {

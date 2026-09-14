@@ -91,15 +91,21 @@ export function carSpeedKmh(rCentre) {
 // caller skip the integral below for places that some other mode already reaches sooner.
 export const CAR_MINUTES_PER_METRE = CAR.detour / ((CAR.topSpeedKmh * 1000) / 60);
 export const carFloorMinutes = (d) => CAR.overhead + d * CAR_MINUTES_PER_METRE;
+// This runs for most of the grid when the car is ticked, so distances use Math.sqrt: Math.hypot
+// gives the same answer to within 1e-13 minutes but takes three times as long.
 export function carMinutes(ox, oy, x, y) {
-  const d = Math.hypot(x - ox, y - oy);
+  const dx = x - ox;
+  const dy = y - oy;
+  const d = Math.sqrt(dx * dx + dy * dy);
   if (d < 40) return 0;
   const n = CAR.samples;
+  const metres = (d / n) * CAR.detour; // driven per sample
   let minutes = 0;
   for (let k = 0; k < n; k++) {
     const t = (k + 0.5) / n;
-    const rc = Math.hypot(ox + (x - ox) * t, oy + (y - oy) * t);
-    minutes += ((d / n) * CAR.detour) / ((carSpeedKmh(rc) * 1000) / 60);
+    const px = ox + dx * t;
+    const py = oy + dy * t;
+    minutes += metres / ((carSpeedKmh(Math.sqrt(px * px + py * py)) * 1000) / 60);
   }
   return CAR.overhead + minutes;
 }
