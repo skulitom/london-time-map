@@ -659,7 +659,9 @@ export class Renderer {
     const y1 = Math.min(held.ph, old.valid[3] + sy);
     if (x1 <= x0 || y1 <= y0) return false;
     // Moving within the canvases copies each onto itself. Resizing a canvas clears it, so when the new
-    // layout needs more room the pixels are copied into larger canvases instead.
+    // layout needs more room the pixels are copied into larger canvases instead. The copy replaces the
+    // pixels it lands on rather than being drawn over them: over them, the transparent overlay would
+    // keep a ghost of the water, parks and lines it held before, to show once new bands go beneath.
     const larger = held.pw > this.layer.width || held.ph > this.layer.height;
     const width = Math.max(held.pw, this.layer.width);
     const height = Math.max(held.ph, this.layer.height);
@@ -674,7 +676,14 @@ export class Renderer {
       }
       const ctx = this[`${name}Ctx`];
       ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.save();
+      // Copying clears whatever it doesn't draw on, so it is clipped to where the pixels go.
+      ctx.beginPath();
+      ctx.rect(x0, y0, x1 - x0, y1 - y0);
+      ctx.clip();
+      ctx.globalCompositeOperation = 'copy';
       ctx.drawImage(from, x0 - sx, y0 - sy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+      ctx.restore();
     }
     this.held = held;
     // The strips around what was kept are rendered as the view needs them, and the rest a frame at a
