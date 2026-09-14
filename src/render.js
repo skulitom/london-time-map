@@ -196,6 +196,18 @@ function dashChunks(coords, runs, on, off, cell, region, pad) {
   return [...paths.values()];
 }
 
+// Makes a layer canvas big enough for pw x ph pixels. It only grows, so that panning and zooming don't
+// keep reallocating it (which also clears it), unless it would pass the pixel limit or has become
+// far bigger than needed.
+function fit(canvas, pw, ph) {
+  if (pw <= canvas.width && ph <= canvas.height && 4 * pw * ph >= canvas.width * canvas.height) return;
+  const width = Math.max(pw, canvas.width);
+  const height = Math.max(ph, canvas.height);
+  const exact = 4 * pw * ph < canvas.width * canvas.height || width * height > LAYER_MAX_PIXELS;
+  canvas.width = exact ? pw : width;
+  canvas.height = exact ? ph : height;
+}
+
 function strokeVisible(ctx, chunks, region, pad) {
   for (const c of chunks) {
     if (c.x1 >= region.x0 - pad && c.x0 <= region.x1 + pad && c.y1 >= region.y0 - pad && c.y0 <= region.y1 + pad) ctx.stroke(c.path);
@@ -251,7 +263,7 @@ export class Renderer {
     this.nodeStyles = new Map();
     this.textWidths = new Map();
     this.tintCache = new Map();
-    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, draws: 0, layerDraws: 0, skipped: 0 };
+    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, scrollMs: 0, draws: 0, layerDraws: 0, scrolls: 0, skipped: 0 };
   }
 
   // Setting a canvas's size clears it, even to the same size, so that only happens on a real change.
@@ -461,8 +473,13 @@ export class Renderer {
     const { k, x, y } = scene.transform;
     const bandsKey = this.bandsKey(scene);
     const overlayKey = this.overlayKey(scene);
-    let held = this.held;
-    let place = held && held.overlayKey === overlayKey ? this.reuse(held, scene.transform, now) : null;
+    let held = this.held && this.held.overlayKey === overlayKey ? this.held : null;
+    let place = held && this.reuse(held, scene.transform, now);
+    // Panned past the layer, or resting near its edge: keep what is there and render only the rest.
+    if (!place && held && held.k === k && held.bandsKey === bandsKey && this.scroll(scene)) {
+      held = this.held;
+      place = this.reuse(held, scene.transform, now);
+    }
     if (!place) {
       this.renderLayer(scene, bandsKey, overlayKey);
       held = this.held;
@@ -533,12 +550,10 @@ export class Renderer {
     }, SETTLE_MS + 30);
   }
 
-  // Renders the map for the current transform over the window plus a margin, cut down to the map:
-  // the overlay first, then the land and bands with the overlay laid over them.
-  renderLayer(scene, bandsKey, overlayKey) {
-    const t0 = performance.now();
+  // The layer's extent for a transform: the window plus a margin that keeps it within its pixel
+  // budget, cut down to the map, and starting on whole device pixels.
+  layout(k, x, y) {
     const { dpr, w, h } = this;
-    const { k, x, y } = scene.transform;
     const area = Math.min(LAYER_WINDOWS * w * h, LAYER_MAX_PIXELS / (dpr * dpr));
     const margin = Math.max(0, (Math.sqrt((w + h) ** 2 + 4 * (area - w * h)) - (w + h)) / 4);
     const pad = 4 + 1.7 * k; // how far strokes can reach past the geometry, in CSS pixels
@@ -547,26 +562,98 @@ export class Renderer {
     const top = Math.floor(Math.max(-margin, b.y0 * k + y - pad) * dpr) / dpr;
     const pw = Math.max(1, Math.ceil((Math.min(w + margin, b.x1 * k + x + pad) - left) * dpr));
     const ph = Math.max(1, Math.ceil((Math.min(h + margin, b.y1 * k + y + pad) - top) * dpr));
-    const region = { x0: (left - x) / k, y0: (top - y) / k, x1: (left + pw / dpr - x) / k, y1: (top + ph / dpr - y) / k };
-    const held = { bandsKey, overlayKey, k, x, y, left, top, width: pw / dpr, height: ph / dpr, pw, ph, pad, margin, region };
+    return { k, x, y, left, top, width: pw / dpr, height: ph / dpr, pw, ph, pad, margin };
+  }
 
-    const o = this.overlayCtx;
-    this.begin(o, this.overlay, held, false);
-    this.drawOverlay(o, scene, k, region);
-    o.restore();
-    this.held = held;
-    this.paintBands(scene, bandsKey);
+  // Renders the map for the current transform over the window plus a margin, cut down to the map.
+  renderLayer(scene, bandsKey, overlayKey) {
+    const t0 = performance.now();
+    const { k, x, y } = scene.transform;
+    this.held = { ...this.layout(k, x, y), bandsKey, overlayKey };
+    fit(this.layer, this.held.pw, this.held.ph);
+    fit(this.overlay, this.held.pw, this.held.ph);
+    this.renderPart(scene, 0, 0, this.held.pw, this.held.ph);
     this.stats.layerMs = performance.now() - t0;
     this.stats.layerDraws++;
   }
 
-  // Paints the land and colour bands into the layer for the transform it holds, then lays the overlay
-  // over them.
+  // Lays the layer out afresh for the current view at the same scale, moving the pixels it already
+  // has so that they stay put on screen, and renders only the strips around them. A pan past the
+  // margin then costs a strip the width of the overshoot rather than the whole layer. Returns false
+  // if nothing can be kept, or the layer would pass its pixel limit.
+  scroll(scene) {
+    const t0 = performance.now();
+    const { dpr } = this;
+    const old = this.held;
+    const { k, x, y } = scene.transform;
+    // Where the old layer is placed on screen, in whole device pixels, and the transform that puts it there.
+    const dx = Math.round((old.left + x - old.x) * dpr);
+    const dy = Math.round((old.top + y - old.y) * dpr);
+    const held = { ...this.layout(k, dx / dpr - old.left + old.x, dy / dpr - old.top + old.y), bandsKey: old.bandsKey, overlayKey: old.overlayKey };
+    // Pixel (i, j) of the old layer becomes pixel (i + sx, j + sy) of the new one.
+    const sx = dx - Math.round(held.left * dpr);
+    const sy = dy - Math.round(held.top * dpr);
+    const x0 = Math.max(0, sx);
+    const y0 = Math.max(0, sy);
+    const x1 = Math.min(held.pw, old.pw + sx);
+    const y1 = Math.min(held.ph, old.ph + sy);
+    if (x1 <= x0 || y1 <= y0) return false;
+    // Moving within the canvases copies each onto itself. Resizing a canvas clears it, so when the new
+    // layout needs more room the pixels are copied into larger canvases instead.
+    const larger = held.pw > this.layer.width || held.ph > this.layer.height;
+    const width = Math.max(held.pw, this.layer.width);
+    const height = Math.max(held.ph, this.layer.height);
+    if (larger && width * height > LAYER_MAX_PIXELS) return false;
+    for (const [name, options] of [['layer', { alpha: false }], ['overlay', {}]]) {
+      const from = this[name];
+      if (larger) {
+        this[name] = document.createElement('canvas');
+        this[name].width = width;
+        this[name].height = height;
+        this[`${name}Ctx`] = this[name].getContext('2d', options);
+      }
+      const ctx = this[`${name}Ctx`];
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(from, x0 - sx, y0 - sy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    }
+    this.held = held;
+    for (const [a, b, c, d] of [[0, 0, held.pw, y0], [0, y1, held.pw, held.ph], [0, y0, x0, y1], [x1, y0, held.pw, y1]]) {
+      if (c > a && d > b) this.renderPart(scene, a, b, c, d);
+    }
+    this.stats.scrollMs = performance.now() - t0;
+    this.stats.scrolls++;
+    return true;
+  }
+
+  // Renders a rectangle of the layer, given in its canvas pixels: the overlay, then the land and bands
+  // with the overlay laid over them.
+  renderPart(scene, x0, y0, x1, y1) {
+    const { dpr, held } = this;
+    const region = {
+      x0: (held.left + x0 / dpr - held.x) / held.k,
+      y0: (held.top + y0 / dpr - held.y) / held.k,
+      x1: (held.left + x1 / dpr - held.x) / held.k,
+      y1: (held.top + y1 / dpr - held.y) / held.k,
+    };
+    const o = this.overlayCtx;
+    this.clipTo(o, x0, y0, x1, y1, false);
+    this.drawOverlay(o, scene, held.k, region);
+    o.restore();
+    this.paintPart(scene, x0, y0, x1, y1);
+  }
+
+  // Paints the land and colour bands into the whole layer at the transform it holds.
   paintBands(scene, bandsKey) {
     const t0 = performance.now();
-    const held = this.held;
+    this.paintPart(scene, 0, 0, this.held.pw, this.held.ph);
+    this.held.bandsKey = bandsKey;
+    this.stats.bandsMs = performance.now() - t0;
+  }
+
+  // Paints the land and colour bands into a rectangle of the layer, then lays the overlay over them.
+  paintPart(scene, x0, y0, x1, y1) {
     const c = this.layerCtx;
-    this.begin(c, this.layer, held, true);
+    this.clipTo(c, x0, y0, x1, y1, true);
     c.fillStyle = COLOURS.land;
     c.fill(this.paths.boroughs, 'evenodd');
     // Travel-time bands, clipped to Greater London and painted lowest band first.
@@ -578,35 +665,23 @@ export class Renderer {
       });
     }
     c.restore();
-    c.drawImage(this.overlay, 0, 0, held.pw, held.ph, 0, 0, held.pw, held.ph);
-    held.bandsKey = bandsKey;
-    this.stats.bandsMs = performance.now() - t0;
+    c.drawImage(this.overlay, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
   }
 
-  // Makes a layer canvas big enough for the part in use, which is cleared (or filled with the
-  // background) and clipped to, and sets the transform the layer is rendered with. The canvas only
-  // grows, so that panning and zooming don't keep reallocating it, unless it would pass the pixel
-  // limit or has become far bigger than needed. Balance with ctx.restore().
-  begin(ctx, canvas, { pw, ph, k, x, y, left, top }, opaque) {
-    if (pw > canvas.width || ph > canvas.height || 4 * pw * ph < canvas.width * canvas.height) {
-      const width = Math.max(pw, canvas.width);
-      const height = Math.max(ph, canvas.height);
-      const exact = 4 * pw * ph < canvas.width * canvas.height || width * height > LAYER_MAX_PIXELS;
-      canvas.width = exact ? pw : width;
-      canvas.height = exact ? ph : height;
-    }
+  // Readies a layer context to draw into a rectangle of its canvas: clears it (or fills it with the
+  // background), clips to it and sets the transform the layer is rendered with. Balance with restore().
+  clipTo(ctx, x0, y0, x1, y1, opaque) {
     const { dpr } = this;
+    const { k, x, y, left, top } = this.held;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (opaque) {
       ctx.fillStyle = COLOURS.bg;
-      ctx.fillRect(0, 0, pw, ph);
-    } else ctx.clearRect(0, 0, pw, ph);
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    } else ctx.clearRect(x0, y0, x1 - x0, y1 - y0);
     ctx.save();
-    if (pw < canvas.width || ph < canvas.height) {
-      ctx.beginPath();
-      ctx.rect(0, 0, pw, ph);
-      ctx.clip();
-    }
+    ctx.beginPath();
+    ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    ctx.clip();
     ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * (x - left), dpr * (y - top));
   }
 
