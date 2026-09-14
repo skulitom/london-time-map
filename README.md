@@ -102,9 +102,11 @@ the fixed overhead plus the straight line at top speed, and any place already re
 another mode skips the integral. That is an exact shortcut, not an approximation.
 
 Loading follows the same idea. `index.html` preloads the data files and the modules, so they
-download alongside D3 instead of after it, and the bulk of `data/transit.json` and `data/base.json`
-(stops, platforms, hops and every coordinate) is stored as delta-encoded integers (`src/data.js`),
-which cuts the two from 718 KB to 286 KB gzipped and makes them quicker to parse.
+download alongside D3 instead of after it, and it loads only the parts of D3 the map uses
+(projection, zoom with its transitions, Delaunay): 47 KB on the wire rather than 76 KB for the whole
+library. The bulk of `data/transit.json` and `data/base.json` (stops, platforms, hops and every
+coordinate) is stored as delta-encoded integers (`src/data.js`), which cuts the two from 718 KB to
+286 KB gzipped and makes them quicker to parse.
 
 ## Data
 

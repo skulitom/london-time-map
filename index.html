@@ -83,7 +83,9 @@
   <div id="tooltip" class="tooltip" hidden></div>
   <div id="loading" class="loading"><span>Loading London…</span></div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+  <!-- Only the parts of D3 the map uses (projection, zoom with its transitions, Delaunay), in the
+       versions D3 7.9.0 is built from: about half the size of the whole library. -->
+  <script src="https://cdn.jsdelivr.net/combine/npm/d3-array@3.2.4/dist/d3-array.min.js,npm/d3-geo@3.1.1/dist/d3-geo.min.js,npm/d3-dispatch@3.0.1/dist/d3-dispatch.min.js,npm/d3-selection@3.0.0/dist/d3-selection.min.js,npm/d3-color@3.1.0/dist/d3-color.min.js,npm/d3-interpolate@3.0.1/dist/d3-interpolate.min.js,npm/d3-ease@3.0.1/dist/d3-ease.min.js,npm/d3-timer@3.0.1/dist/d3-timer.min.js,npm/d3-transition@3.0.1/dist/d3-transition.min.js,npm/d3-drag@3.0.0/dist/d3-drag.min.js,npm/d3-zoom@3.0.0/dist/d3-zoom.min.js,npm/delaunator@5.0.1/delaunator.min.js,npm/d3-delaunay@6.0.4/dist/d3-delaunay.min.js"></script>
   <script type="module" src="src/main.js"></script>
 </body>
 </html>
