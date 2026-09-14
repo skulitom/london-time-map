@@ -16,7 +16,10 @@
 //     in chunks sized to the zoom level, National Rail dashes are laid out here rather than by the
 //     canvas (which dashes the whole of every line, off-screen parts included), and chunks out of view
 //     are skipped.
-//   - Geometry is held as Path2D objects in base coordinates and re-used under the canvas transform.
+//   - Geometry is held in base coordinates and drawn under the canvas transform. Chrome does the work
+//     of a whole path for every draw, however little of it the clip lets through, so each part of the
+//     layer draws only the rings and lines that reach into it, and re-uses a shape's whole Path2D when
+//     all of them do.
 
 import { GROUP_OF_MODE, RING_MINUTES, bandColour } from './model.js';
 
@@ -50,6 +53,7 @@ const CHUNK_PX = 128;           // target size of a chunk of lines, in device pi
 const NODE_CELL_PX = 128;       // station and place markers are batched per cell of this many pixels
 const SETTLE_MS = 150;          // a scaled layer is rendered sharp once the zoom has been still this long
 const VIEW_PAD = 32;            // CSS pixels of margin rendered with the window's part of a fresh layer
+const SHAPE_PAD = 2;            // strokes reach this many base units plus as many CSS pixels past their geometry
 const LAYER_WINDOWS = 2;        // the map layer (and its overlay) covers at most this many windows' worth of pixels...
 const LAYER_MAX_PIXELS = 16e6;  // ...and never more than iOS Safari allows one canvas
 
@@ -215,6 +219,66 @@ function strokeVisible(ctx, chunks, region, pad) {
   }
 }
 
+// A set of rings or lines ([start, count] pairs into interleaved coordinates) with the bounding box of
+// each run, so that a path of just the runs reaching into part of the layer can be made without
+// looking at their points. The path of the whole set is made the first time it is needed.
+function shape(coords, runs, close) {
+  const n = runs.length / 2;
+  const boxes = new Float64Array(4 * n);
+  const bbox = [Infinity, Infinity, -Infinity, -Infinity];
+  for (let r = 0; r < n; r++) {
+    const start = runs[2 * r];
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = start; i < start + runs[2 * r + 1]; i++) {
+      const x = coords[2 * i];
+      const y = coords[2 * i + 1];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+    boxes[4 * r] = x0;
+    boxes[4 * r + 1] = y0;
+    boxes[4 * r + 2] = x1;
+    boxes[4 * r + 3] = y1;
+    if (x0 < bbox[0]) bbox[0] = x0;
+    if (y0 < bbox[1]) bbox[1] = y0;
+    if (x1 > bbox[2]) bbox[2] = x1;
+    if (y1 > bbox[3]) bbox[3] = y1;
+  }
+  return { coords, runs, boxes, bbox, close, path: null };
+}
+
+// The path of a shape's runs that reach into a region grown by pad, or the whole path when they all
+// do. Runs that stay outside can't change a pixel inside, whatever the fill rule.
+function within(s, region, pad) {
+  const { coords, runs, boxes, bbox, close } = s;
+  const n = runs.length / 2;
+  const x0 = region.x0 - pad;
+  const y0 = region.y0 - pad;
+  const x1 = region.x1 + pad;
+  const y1 = region.y1 + pad;
+  const reaches = (r) => boxes[4 * r + 2] >= x0 && boxes[4 * r] <= x1 && boxes[4 * r + 3] >= y0 && boxes[4 * r + 1] <= y1;
+  let reached = 0;
+  if (bbox[0] >= x0 && bbox[1] >= y0 && bbox[2] <= x1 && bbox[3] <= y1) reached = n;
+  else while (reached < n && reaches(reached)) reached++;
+  if (reached === n) {
+    if (!s.path) {
+      s.path = new Path2D();
+      for (let r = 0; r < n; r++) Renderer.addRing(s.path, coords, runs[2 * r], runs[2 * r + 1], close);
+    }
+    return s.path;
+  }
+  const path = new Path2D();
+  for (let r = 0; r < n; r++) {
+    if (reaches(r)) Renderer.addRing(path, coords, runs[2 * r], runs[2 * r + 1], close);
+  }
+  return path;
+}
+
 function boundsOf(coords, bounds = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }) {
   for (let i = 0; i < coords.length; i += 2) {
     const x = coords[i];
@@ -254,9 +318,9 @@ export class Renderer {
     this.dpr = 1;
     this.w = 0;
     this.h = 0;
-    this.paths = null;
+    this.shapes = null;
     this.pathKey = null;
-    this.bandPaths = null;
+    this.bandShapes = null;
     this.bandKey = null;
     this.bounds = null;
     this.ghost = null;
@@ -331,29 +395,25 @@ export class Renderer {
     return path;
   }
 
-  static segsPath(coords, segs) {
-    const path = new Path2D();
-    for (const [s, c] of segs) Renderer.addRing(path, coords, s, c, false);
-    return path;
-  }
-
   // Map geometry is rebuilt only when it moves (the time-stretch option), colour bands whenever they
   // are recalculated. The bus network, the ghost outline and line chunks never move, so they are built
   // once, the chunks lazily for each zoom level that needs them.
   ensurePaths(scene) {
     const t0 = performance.now();
     let built = false;
-    if (scene.geomVersion !== this.pathKey || !this.paths) {
+    if (scene.geomVersion !== this.pathKey || !this.shapes) {
       const W = scene.mesh.warped;
       const L = scene.layers;
-      this.paths = {
-        boroughs: Renderer.polysPath(W, L.boroughs),
-        parks: Renderer.polysPath(W, L.parks),
-        thames: Renderer.polysPath(W, L.thames),
-        water: Renderer.polysPath(W, L.water),
-        thamesLine: Renderer.segsPath(W, L.thamesLine),
+      const rings = (polys) => Int32Array.from(polys.flatMap((poly) => poly.rings.flat()));
+      const lines = (runs) => Int32Array.from(runs.flat());
+      this.shapes = {
+        boroughs: shape(W, rings(L.boroughs), true),
+        parks: shape(W, rings(L.parks), true),
+        thames: shape(W, rings(L.thames), true),
+        water: shape(W, rings(L.water), true),
+        thamesLine: shape(W, lines(L.thamesLine), false),
         rail: MODE_ORDER.filter((mode) => L.railByMode[mode])
-          .map((mode) => [mode, L.railByMode[mode].map(([li, segs]) => [li, segs, Renderer.segsPath(W, segs)])]),
+          .map((mode) => [mode, L.railByMode[mode].map(([li, segs]) => [li, segs, shape(W, lines(segs), false)])]),
       };
       this.meshBounds = boundsOf(W, boundsOf(scene.busSegments));
       this.pathKey = scene.geomVersion;
@@ -362,16 +422,11 @@ export class Renderer {
     const bandKey = `${scene.bandsVersion}|${scene.geomVersion}`;
     if (bandKey !== this.bandKey) {
       const bands = scene.bands;
-      this.bandPaths = null;
+      this.bandShapes = null;
       this.bounds = this.meshBounds;
       if (bands) {
         // Bands are only filled, which closes every ring implicitly.
-        this.bandPaths = bands.list.map((band) => {
-          const path = new Path2D();
-          const { rings } = band;
-          for (let r = 0; r < rings.length; r += 2) Renderer.addRing(path, bands.coords, rings[r], rings[r + 1], false);
-          return path;
-        });
+        this.bandShapes = bands.list.map((band) => shape(bands.coords, band.rings, false));
         this.bounds = boundsOf(bands.coords, { ...this.meshBounds });
       }
       this.bandKey = bandKey;
@@ -702,18 +757,22 @@ export class Renderer {
   // Renders a rectangle of the layer, given in its canvas pixels: the overlay, then the land and bands
   // with the overlay laid over them.
   renderPart(scene, x0, y0, x1, y1) {
+    const o = this.overlayCtx;
+    this.clipTo(o, x0, y0, x1, y1, false);
+    this.drawOverlay(o, scene, this.held.k, this.regionOf(x0, y0, x1, y1));
+    o.restore();
+    this.paintPart(scene, x0, y0, x1, y1);
+  }
+
+  // A rectangle of the layer, in its canvas pixels, as a region of the map in base coordinates.
+  regionOf(x0, y0, x1, y1) {
     const { dpr, held } = this;
-    const region = {
+    return {
       x0: (held.left + x0 / dpr - held.x) / held.k,
       y0: (held.top + y0 / dpr - held.y) / held.k,
       x1: (held.left + x1 / dpr - held.x) / held.k,
       y1: (held.top + y1 / dpr - held.y) / held.k,
     };
-    const o = this.overlayCtx;
-    this.clipTo(o, x0, y0, x1, y1, false);
-    this.drawOverlay(o, scene, held.k, region);
-    o.restore();
-    this.paintPart(scene, x0, y0, x1, y1);
   }
 
   // Paints the land and colour bands into the rendered part of the layer, at the transform it holds.
@@ -729,15 +788,18 @@ export class Renderer {
   // Paints the land and colour bands into a rectangle of the layer, then lays the overlay over them.
   paintPart(scene, x0, y0, x1, y1) {
     const c = this.layerCtx;
+    const region = this.regionOf(x0, y0, x1, y1);
+    const pad = SHAPE_PAD + SHAPE_PAD / this.held.k;
     this.clipTo(c, x0, y0, x1, y1, true);
+    const london = within(this.shapes.boroughs, region, pad);
     c.fillStyle = COLOURS.land;
-    c.fill(this.paths.boroughs, 'evenodd');
+    c.fill(london, 'evenodd');
     // Travel-time bands, clipped to Greater London and painted lowest band first.
-    if (this.bandPaths) {
-      c.clip(this.paths.boroughs, 'evenodd');
+    if (this.bandShapes) {
+      c.clip(london, 'evenodd');
       scene.bands.list.forEach((band, i) => {
         c.fillStyle = this.tint(band.colour);
-        c.fill(this.bandPaths[i], 'evenodd');
+        c.fill(within(this.bandShapes[i], region, pad), 'evenodd');
       });
     }
     c.restore();
@@ -763,27 +825,28 @@ export class Renderer {
 
   // Everything of the map drawn over the colour bands.
   drawOverlay(ctx, scene, k, region) {
-    const { paths, dpr } = this;
+    const { shapes, dpr } = this;
     const px = (n) => n / k;
     const cell = chunkCell(k, dpr);
     const base = scene.mesh.base;
     const coords = scene.mesh.warped; // the same as base unless the map is stretched
+    const part = (s) => within(s, region, SHAPE_PAD + SHAPE_PAD / k);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
 
     ctx.strokeStyle = COLOURS.landBorder;
     ctx.lineWidth = px(1);
-    ctx.stroke(paths.boroughs);
+    ctx.stroke(part(shapes.boroughs));
 
-    ctx.globalAlpha = this.bandPaths ? 0.55 : 1;
+    ctx.globalAlpha = this.bandShapes ? 0.55 : 1;
     ctx.fillStyle = COLOURS.park;
-    ctx.fill(paths.parks, 'evenodd');
+    ctx.fill(part(shapes.parks), 'evenodd');
     ctx.globalAlpha = 1;
 
     ctx.strokeStyle = COLOURS.water;
     ctx.lineWidth = 3.2;
-    ctx.stroke(paths.thamesLine);
-    for (const water of [paths.thames, paths.water]) {
+    ctx.stroke(part(shapes.thamesLine));
+    for (const water of [part(shapes.thames), part(shapes.water)]) {
       ctx.fillStyle = COLOURS.water;
       ctx.fill(water, 'evenodd');
       ctx.strokeStyle = COLOURS.waterEdge;
@@ -817,14 +880,14 @@ export class Renderer {
     }
 
     // Rail lines, dimmed when their tick box is off. National Rail is dashed.
-    for (const [mode, group] of paths.rail) {
+    for (const [mode, group] of shapes.rail) {
       const on = !!scene.enabled[GROUP_OF_MODE[mode]];
       const dashed = mode === 'national-rail';
       ctx.globalAlpha = on ? (dashed ? 0.75 : 0.95) : 0.18;
       ctx.lineWidth = px(MODE_WIDTH[mode]) + (on ? 0.12 : 0.05);
-      for (const [lineIdx, segs, path] of group) {
+      for (const [lineIdx, segs, line] of group) {
         ctx.strokeStyle = scene.lines[lineIdx].colour;
-        if (!dashed) ctx.stroke(path);
+        if (!dashed) ctx.stroke(part(line));
         else for (const dashes of dashChunks(coords, segs, px(6), px(4), cell, region, ctx.lineWidth)) ctx.stroke(dashes);
       }
     }

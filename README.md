@@ -90,9 +90,11 @@ graphics card. These rules keep it cheap:
   than the same lines cut into pieces a hundred or so pixels across, so the bus network and the roads
   are drawn in chunks sized to the zoom level and chunks out of view are skipped. National Rail
   dashes are laid out in script rather than by the canvas, which dashes every line from end to end
-  however little of it is on screen.
-- **Paths are built once.** Geometry lives in `Path2D` objects in base coordinates and is re-used
-  under the canvas transform. Only the colour bands are rebuilt when the times change.
+  however little of it is on screen. For the same reason each part of the layer draws only the rings
+  and lines that reach into it: Chrome does the work of a whole path, whatever the clip lets through.
+- **Paths are built once.** Geometry lives in base coordinates, with the bounding box of every ring
+  and line, and whole `Path2D` objects are re-used under the canvas transform. Only the colour bands
+  are rebuilt when the times change.
 - **Recalculation happens in one task.** Changing the start point or a tick box runs the search, the
   surface and the contours start to finish and then paints, so the map is never left half-drawn, not
   even in a window that is hidden or behind another one and therefore gets no animation frames.
