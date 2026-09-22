@@ -4,13 +4,13 @@
 // (in Chrome, on the GPU process), so the renderer is built around rasterising as little as possible:
 //   - A frame is only drawn when something it depends on has changed. Every input to the picture
 //     (transform, data, toggles, hovered place, size) goes into one key; if the key matches the last
-//     frame the canvas already holds the right pixels and draw() returns without touching it.
+//     frame the layers already hold the right pixels and draw() returns without touching them.
 //   - The map itself (land, colour bands, water, roads, the bus and rail networks) is rendered into
-//     an offscreen layer covering the window plus a margin, and frames copy it. Panning moves the copy
-//     by whole device pixels, and hovering redraws only what sits on top of it: the route, stations,
-//     places and labels. While zooming the copy is scaled, and once the zoom has been still for a
-//     moment the layer is rendered sharp at the new scale. Everything above the colour bands is also
-//     kept in a transparent overlay, so new travel times repaint only the bands.
+//     a padded canvas layer, with stations, places and labels cached in a second layer. Panning moves
+//     both with CSS transforms: no full-window bitmap copies, marker redraws or label layout per
+//     frame. A stable transparent canvas receives input and draws the changing route and hover ring.
+//     Zooming scales both layers until the view settles and is rendered sharp. Everything above the
+//     colour bands is also kept in an offscreen overlay, so new travel times repaint only the bands.
 //   - Chrome rasterises a stroked path whose bounds span the screen far more slowly than the same
 //     lines cut into pieces a hundred or so pixels across. So the bus network and the roads are drawn
 //     in chunks sized to the zoom level, National Rail dashes are laid out here rather than by the
@@ -56,6 +56,35 @@ const VIEW_PAD = 32;            // CSS pixels of margin rendered with the window
 const SHAPE_PAD = 2;            // strokes reach this many base units plus as many CSS pixels past their geometry
 const LAYER_WINDOWS = 2;        // the map layer (and its overlay) covers at most this many windows' worth of pixels...
 const LAYER_MAX_PIXELS = 16e6;  // ...and never more than iOS Safari allows one canvas
+
+// Label candidates only need to check nearby labels, rather than every label already placed.
+export class LabelIndex {
+  constructor(cellSize = 64) { this.cellSize = cellSize; this.cells = new Map(); }
+
+  overlaps(box) {
+    const [x0, y0, x1, y1] = box;
+    const size = this.cellSize;
+    for (let y = Math.floor(y0 / size); y <= Math.floor(y1 / size); y++) {
+      for (let x = Math.floor(x0 / size); x <= Math.floor(x1 / size); x++) {
+        const entries = this.cells.get(`${x},${y}`);
+        if (entries?.some((q) => x0 < q[2] && x1 > q[0] && y0 < q[3] && y1 > q[1])) return true;
+      }
+    }
+    return false;
+  }
+
+  insert(box) {
+    const size = this.cellSize;
+    for (let y = Math.floor(box[1] / size); y <= Math.floor(box[3] / size); y++) {
+      for (let x = Math.floor(box[0] / size); x <= Math.floor(box[2] / size); x++) {
+        const key = `${x},${y}`;
+        let entries = this.cells.get(key);
+        if (!entries) this.cells.set(key, (entries = []));
+        entries.push(box);
+      }
+    }
+  }
+}
 
 function hexToRgb(hex) {
   const n = parseInt(hex.slice(1), 16);
@@ -299,11 +328,24 @@ export class Renderer {
   // margin is still to render.
   constructor(canvas, { onSettle = () => {} } = {}) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d', { alpha: false });
+    // The stable input canvas holds only the changing route/hover overlay. The map and labels
+    // move as compositor layers, so a pan does not copy millions of pixels through this canvas.
+    this.ctx = canvas.getContext('2d');
     this.layer = document.createElement('canvas');
     this.layer.width = 1;
     this.layer.height = 1;
     this.layerCtx = this.layer.getContext('2d', { alpha: false });
+    this.layer.className = 'map-layer';
+    this.layer.setAttribute('aria-hidden', 'true');
+    canvas.before(this.layer);
+    this.features = document.createElement('canvas');
+    this.features.width = this.features.height = 1;
+    this.featuresCtx = this.features.getContext('2d');
+    this.features.className = 'map-layer';
+    this.features.setAttribute('aria-hidden', 'true');
+    canvas.after(this.features);
+    this.featureKey = null;
+    this.overlayPainted = false;
     this.overlay = document.createElement('canvas');
     this.overlay.width = 1;
     this.overlay.height = 1;
@@ -330,7 +372,7 @@ export class Renderer {
     this.nodeStyles = new Map();
     this.textWidths = new Map();
     this.tintCache = new Map();
-    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, scrollMs: 0, draws: 0, layerDraws: 0, scrolls: 0, parts: 0, skipped: 0 };
+    this.stats = { drawMs: 0, pathMs: 0, layerMs: 0, bandsMs: 0, scrollMs: 0, featureMs: 0, featureDraws: 0, draws: 0, layerDraws: 0, scrolls: 0, parts: 0, skipped: 0 };
   }
 
   // Setting a canvas's size clears it, even to the same size, so that only happens on a real change.
@@ -372,6 +414,7 @@ export class Renderer {
   // Text widths depend on the font, so they are measured again once web fonts have loaded.
   fontsChanged() {
     this.textWidths.clear();
+    this.featureKey = null;
     this.frameKey = null;
   }
 
@@ -486,7 +529,15 @@ export class Renderer {
 
     // Everything on top of the map layer uses the transform the layer was placed with, which can
     // differ from the frame's by under half a device pixel.
-    const { k, x: tx, y: ty } = this.placeLayer(scene, now);
+    const place = this.placeLayer(scene, now);
+    const { k, x: tx, y: ty } = place;
+    this.placeFeatures(scene, place);
+
+    if (this.overlayPainted) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+    this.overlayPainted = !!scene.route || scene.hover >= 0;
 
     if (scene.route) {
       ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
@@ -495,7 +546,39 @@ export class Renderer {
       this.drawRoute(ctx, scene, (n) => n / k);
     }
 
-    // Screen space from here on.
+    if (scene.hover >= 0) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.beginPath();
+      ctx.arc(scene.nodeX[scene.hover] * k + tx, scene.nodeY[scene.hover] * k + ty, 7, 0, TAU);
+      ctx.strokeStyle = COLOURS.accent;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  // Cache all the stationary detail over the same padded extent as the map. In particular, label
+  // collision detection and text rasterisation must not run for each pointer movement.
+  placeFeatures(scene, place) {
+    const held = this.held;
+    const key = [scene.geomVersion, scene.dataVersion, scene.showStations, scene.origin.x,
+      scene.origin.y, scene.origin.name, scene.origin.node, scene.ringScale, scene.morph,
+      held.k, held.x - held.left, held.y - held.top, held.pw, held.ph, this.dpr].join('|');
+    if (key !== this.featureKey) {
+      this.renderFeatures(scene);
+      this.featureKey = key;
+    }
+    this.positionLayer(this.features, held, place);
+  }
+
+  renderFeatures(scene) {
+    const start = performance.now();
+    const { held, dpr, featuresCtx: ctx } = this;
+    const { k } = held;
+    const tx = held.x - held.left;
+    const ty = held.y - held.top;
+    fit(this.features, held.pw, held.ph);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.features.width, this.features.height);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const N = scene.nodes.length;
     if (!this.nodeScreen || this.nodeScreen.length !== 2 * N) this.nodeScreen = new Float32Array(2 * N);
@@ -507,10 +590,22 @@ export class Renderer {
     const ox = scene.origin.x * k + tx;
     const oy = scene.origin.y * k + ty;
 
-    this.drawRings(ctx, scene, ox, oy, k);
-    this.drawNodes(ctx, scene, S, k);
+    const cached = { ...scene, hover: -1 };
+    this.drawRings(ctx, cached, ox, oy, k, held.width, held.height);
+    this.drawNodes(ctx, cached, S, k, held.width, held.height);
     this.drawOriginDot(ctx, ox, oy);
-    this.drawLabels(ctx, scene, S, k, ox, oy);
+    this.drawLabels(ctx, cached, S, k, ox, oy, held.width, held.height);
+    this.stats.featureMs = performance.now() - start;
+    this.stats.featureDraws++;
+  }
+
+  positionLayer(canvas, held, place) {
+    const { dpr } = this;
+    // Allocations may be larger than the current extent; clip off their unused pixels.
+    canvas.style.width = `${canvas.width / dpr}px`;
+    canvas.style.height = `${canvas.height / dpr}px`;
+    canvas.style.clipPath = `inset(0 ${(canvas.width - held.pw) / dpr}px ${(canvas.height - held.ph) / dpr}px 0)`;
+    canvas.style.transform = `translate3d(${place.left}px, ${place.top}px, 0) scale(${place.scale})`;
   }
 
   // ---------------------------------------------------------------- map layer
@@ -532,10 +627,9 @@ export class Renderer {
     ].join('|');
   }
 
-  // Copies the map layer onto the canvas, rendering it first if the one held can't be used for this
-  // frame, and returns the transform it was placed with.
+  // Positions the map's compositor layer, rendering it first if the held pixels cannot cover the
+  // view, and returns the transform shared by the labels and interaction overlay.
   placeLayer(scene, now) {
-    const { ctx, dpr } = this;
     const { k, x, y } = scene.transform;
     const bandsKey = this.bandsKey(scene);
     const overlayKey = this.overlayKey(scene);
@@ -556,15 +650,7 @@ export class Renderer {
       this.renderPending(scene);
     }
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = COLOURS.bg;
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-    if (place.scale === 1) {
-      ctx.drawImage(this.layer, 0, 0, held.pw, held.ph, Math.round(place.left * dpr), Math.round(place.top * dpr), held.pw, held.ph);
-    } else {
-      ctx.setTransform(place.scale, 0, 0, place.scale, place.left * dpr, place.top * dpr);
-      ctx.drawImage(this.layer, 0, 0, held.pw, held.ph, 0, 0, held.pw, held.ph);
-    }
+    this.positionLayer(this.layer, held, place);
     return place;
   }
 
@@ -728,6 +814,11 @@ export class Renderer {
         this[name].width = width;
         this[name].height = height;
         this[`${name}Ctx`] = this[name].getContext('2d', options);
+        if (name === 'layer') {
+          this[name].className = 'map-layer';
+          this[name].setAttribute('aria-hidden', 'true');
+          from.replaceWith(this[name]);
+        }
       }
       const ctx = this[`${name}Ctx`];
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -930,12 +1021,12 @@ export class Renderer {
     ctx.restore();
   }
 
-  drawRings(ctx, scene, ox, oy, k) {
+  drawRings(ctx, scene, ox, oy, k, w = this.w, h = this.h) {
     const scale = scene.ringScale * k;
     if (!(scale > 0)) return;
     const alpha = Math.max(0, Math.min(1, scene.morph)) ** 2;
     if (alpha <= 0.02) return;
-    const maxR = Math.hypot(this.w, this.h);
+    const maxR = Math.hypot(w, h);
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.font = '500 11px Inter, system-ui, sans-serif';
@@ -952,7 +1043,7 @@ export class Renderer {
       ctx.stroke();
       ctx.setLineDash([]);
       const ly = oy - r - 3;
-      if (ly > 8 && ly < this.h && ox > 0 && ox < this.w) {
+      if (ly > 8 && ly < h && ox > 0 && ox < w) {
         const label = `${t} min`;
         const tw = this.measure(ctx, label);
         ctx.fillStyle = COLOURS.bg;
@@ -968,10 +1059,8 @@ export class Renderer {
 
   // Stations and places: one path per fill/stroke combination and screen cell, so that each path
   // stays small enough to rasterise quickly. Styles are painted in the order they first appear.
-  drawNodes(ctx, scene, S, k) {
+  drawNodes(ctx, scene, S, k, w = this.w, h = this.h) {
     const { nodes, times } = scene;
-    const w = this.w;
-    const h = this.h;
     const margin = 10;
     const styles = this.nodeStyles;
     styles.clear();
@@ -988,7 +1077,9 @@ export class Renderer {
       path.moveTo(x + r, y);
       path.arc(x, y, r, 0, TAU);
     };
-    const stationR = k < 1.5 ? 1.7 : 2.2;
+    // At a city-wide phone view, full-sized stops obscure the colour bands underneath.
+    const densityScale = Math.max(0.6, Math.min(1, k / 0.8));
+    const stationR = (k < 1.5 ? 1.7 : 2.2) * densityScale;
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
       const x = S[2 * i];
@@ -1000,12 +1091,12 @@ export class Renderer {
         if (!scene.showStations) continue;
         if (n.lineIds.size >= 2) {
           add(unreachable ? 'rgba(20,26,36,0.9)' : colour || COLOURS.bg,
-            unreachable ? 'rgba(200,208,220,0.35)' : 'rgba(232,236,241,0.9)', stationR + 1.2, x, y);
+            unreachable ? 'rgba(200,208,220,0.35)' : 'rgba(232,236,241,0.9)', stationR + 1.2 * densityScale, x, y);
         } else {
           add(unreachable ? 'rgba(160,170,185,0.3)' : colour || 'rgba(190,200,215,0.85)', null, stationR, x, y);
         }
       } else {
-        const r = n.tier === 1 ? 3.8 : n.tier === 2 ? 3.2 : 2.6;
+        const r = (n.tier === 1 ? 3.8 : n.tier === 2 ? 3.2 : 2.6) * densityScale;
         add(unreachable ? 'rgba(255,255,255,0.25)' : colour || '#ffffff',
           unreachable ? 'rgba(255,255,255,0.4)' : '#ffffff', r, x, y);
       }
@@ -1045,10 +1136,8 @@ export class Renderer {
     ctx.stroke();
   }
 
-  drawLabels(ctx, scene, S, k, ox, oy) {
+  drawLabels(ctx, scene, S, k, ox, oy, w = this.w, h = this.h) {
     const { nodes, times } = scene;
-    const w = this.w;
-    const h = this.h;
     const candidates = [];
     candidates.push({ x: ox, y: oy, text: scene.origin.name, priority: -1, size: 13, weight: 700, colour: COLOURS.accent, offset: 9 });
     for (let i = 0; i < nodes.length; i++) {
@@ -1073,7 +1162,8 @@ export class Renderer {
     }
     candidates.sort((a, b) => a.priority - b.priority);
 
-    const placed = [];
+    const placed = new LabelIndex();
+    const labelGap = k < 0.6 ? 5 : 2;
     ctx.textBaseline = 'middle';
     ctx.lineJoin = 'round';
     for (const c of candidates) {
@@ -1089,18 +1179,14 @@ export class Renderer {
       ];
       for (const opt of options) {
         const x0 = opt.align === 'left' ? opt.x : opt.align === 'right' ? opt.x - tw : opt.x - tw / 2;
-        const bx0 = x0 - 2;
-        const bx1 = x0 + tw + 2;
-        const by0 = opt.y - th / 2 - 1;
-        const by1 = opt.y + th / 2 + 1;
+        const bx0 = x0 - labelGap;
+        const bx1 = x0 + tw + labelGap;
+        const by0 = opt.y - th / 2 - labelGap / 2;
+        const by1 = opt.y + th / 2 + labelGap / 2;
         if (bx0 < 2 || by0 < 2 || bx1 > w - 2 || by1 > h - 2) continue;
-        let clash = false;
-        for (let p = 0; p < placed.length && !clash; p++) {
-          const q = placed[p];
-          clash = bx0 < q[2] && bx1 > q[0] && by0 < q[3] && by1 > q[1];
-        }
-        if (clash) continue;
-        placed.push([bx0, by0, bx1, by1]);
+        const box = [bx0, by0, bx1, by1];
+        if (placed.overlaps(box)) continue;
+        placed.insert(box);
         ctx.textAlign = opt.align;
         const dim = c.index !== undefined && times && !Number.isFinite(times[c.index]);
         ctx.globalAlpha = dim ? 0.45 : 1;

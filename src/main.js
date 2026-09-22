@@ -1,20 +1,22 @@
 // Application controller: loads data, runs the routing engine, builds the colour bands, wires the UI.
 
-import { Engine, toMetres, METRES_PER_DEG } from './engine.js';
+import { Engine, toMetres } from './engine.js';
 import { WalkGrid } from './walkgrid.js';
 import { Warp } from './warp.js';
 import { Renderer, COLOURS, blend } from './render.js';
-import { contourBands } from './contours.js';
+import { Calculator } from './calculate.js';
+import { RoutingClient } from './routing-client.js';
+import { installSearch } from './search.js';
 import { unpackTransit, unpackRuns } from './data.js';
-import { MODES, BANDS, BAND_THRESHOLDS, UNREACHABLE_COLOUR, CENTRE, carMinutes, carFloorMinutes, CAR_MINUTES_PER_METRE, CAR } from './model.js';
+import { MODES, BANDS, UNREACHABLE_COLOUR } from './model.js';
 
 const DEFAULT_ORIGIN = { lat: 51.508, lon: -0.1281, name: 'Trafalgar Square', node: -1 };
 const BASE_SIZE = 1000;
 const RING_POINTS = 40;
 const ANIM_MS = 950;
 const RAIL_MODES = new Set(['tube', 'dlr', 'elizabeth-line', 'overground', 'national-rail', 'tram']);
-const POSTCODE_FULL = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
-const POSTCODE_OUTWARD = /^[A-Z]{1,2}\d[A-Z\d]?$/i;
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+const smallScreen = window.matchMedia('(max-width: 760px)');
 
 const state = {
   enabled: { foot: false, underground: true, trains: true, bus: true, car: false },
@@ -65,20 +67,6 @@ function formatMinutes(t) {
   return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`;
 }
 
-async function lookupPostcode(text) {
-  const compact = text.replace(/\s+/g, '').toUpperCase();
-  let url;
-  if (POSTCODE_FULL.test(text.trim())) url = `https://api.postcodes.io/postcodes/${encodeURIComponent(compact)}`;
-  else if (POSTCODE_OUTWARD.test(compact)) url = `https://api.postcodes.io/outcodes/${encodeURIComponent(compact)}`;
-  else return null;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const json = await res.json();
-  const r = json.result;
-  if (!r || !Number.isFinite(r.latitude)) return null;
-  return { lat: r.latitude, lon: r.longitude, name: r.postcode || r.outcode };
-}
-
 async function main() {
   const [base, gridJson, transitJson, places] = await Promise.all([
     loadJSON('data/base.json'), loadJSON('data/walkgrid.json'), loadJSON('data/transit.json'), loadJSON('data/places.json'),
@@ -87,8 +75,8 @@ async function main() {
 
   const transit = unpackTransit(transitJson);
   const grid = WalkGrid.fromJSON(gridJson);
+  if (grid.cellOf(state.origin.lon, state.origin.lat) < 0) state.origin = { ...DEFAULT_ORIGIN };
   const engine = new Engine(transit, grid);
-  const C = grid.count;
   const { stopLat, stopLon, platformStop, platformLine, rideFrom, rideTo } = transit;
 
   // ---------------------------------------------------------------- places and stations
@@ -268,7 +256,6 @@ async function main() {
 
   // ---------------------------------------------------------------- computation
   let originBase = proj(state.origin.lon, state.origin.lat);
-  let originCell = -1;
   let lastResult = null;
   let times = null;        // minutes to each node, or null when nothing is ticked
   let nodeByCar = null;
@@ -284,86 +271,7 @@ async function main() {
   let dataVersion = 0;   // times, routing result
   let styleVersion = 0;  // toggles that change how things are drawn
 
-  function compute() {
-    const anyMode = MODES.some((m) => state.enabled[m.id]);
-    originCell = grid.nearestWalkable(grid.cellOf(state.origin.lon, state.origin.lat));
-    dataVersion++;
-    if (!anyMode || originCell < 0) {
-      lastResult = null;
-      times = null;
-      nodeByCar = null;
-      surface = null;
-      bandsGeom = null;
-      bandsVersion++;
-      coverage = { londonCells: 0, within45: 0 };
-      return;
-    }
-    const t0 = performance.now();
-    lastResult = engine.route(originCell, state.enabled);
-    const t1 = performance.now();
-    const dist = lastResult.dist;
-    const [ox, oy] = toMetres(state.origin.lon, state.origin.lat);
-
-    // One pass over the grid: copy the walking/transit times, fold in driving where it is quicker,
-    // and count how much of Greater London falls inside 45 minutes.
-    if (!surface || surface.length !== C) surface = new Float32Array(C);
-    const car = state.enabled.car;
-    const { cols, rows, mask, london } = grid;
-    const stepX = gridDLon * METRES_PER_DEG.x;
-    let londonCells = 0;
-    let within45 = 0;
-    for (let j = 0, c = 0; j < rows; j++) {
-      const my = (gridLat0 + (j + 0.5) * gridDLat - CENTRE.lat) * METRES_PER_DEG.y;
-      let mx = (gridLon0 + 0.5 * gridDLon - CENTRE.lon) * METRES_PER_DEG.x;
-      for (let i = 0; i < cols; i++, c++, mx += stepX) {
-        let t = dist[c];
-        // Driving is only worked out where it could actually win: the cheapest conceivable drive is
-        // the fixed overhead plus the straight line at top speed.
-        if (car && t > CAR.overhead) {
-          const dx = mx - ox;
-          const dy = my - oy;
-          if (t > CAR.overhead + Math.sqrt(dx * dx + dy * dy) * CAR_MINUTES_PER_METRE) {
-            const tc = carMinutes(ox, oy, mx, my);
-            if (tc < t) t = tc;
-          }
-        }
-        surface[c] = t;
-        if (london[c] && mask[c]) {
-          londonCells++;
-          if (t <= 45) within45++;
-        }
-      }
-    }
-    coverage = { londonCells, within45 };
-
-    if (!times || times.length !== N) times = new Float64Array(N);
-    if (!nodeByCar) nodeByCar = new Uint8Array(N);
-    nodeByCar.fill(0);
-    for (let i = 0; i < N; i++) {
-      const c = nodeCell[i];
-      let t = c >= 0 ? dist[c] : Infinity;
-      if (car && t > carFloorMinutes(Math.hypot(nodeMx[i] - ox, nodeMy[i] - oy))) {
-        const tc = carMinutes(ox, oy, nodeMx[i], nodeMy[i]);
-        if (tc < t) {
-          t = tc;
-          nodeByCar[i] = 1;
-        }
-      }
-      times[i] = t;
-    }
-    const t2 = performance.now();
-    bandsGeom = buildBands(surface);
-    bandsVersion++;
-    lastTiming = { routeMs: t1 - t0, surfaceMs: t2 - t1, bandsMs: performance.now() - t2 };
-  }
-
-  // Filled contour bands of the travel-time surface, in base coordinates. Each band is a set of rings
-  // (first vertex, vertex count) to fill with the even-odd rule.
-  const bandValues = new Float64Array(C);
-  const bandThresholds = [...BAND_THRESHOLDS, 1e8];
-  function buildBands(surf) {
-    for (let c = 0; c < C; c++) bandValues[c] = Number.isFinite(surf[c]) ? surf[c] : 1e9;
-    const { coords, bands } = contourBands(bandValues, grid.cols, grid.rows, bandThresholds);
+  function buildBands({ coords, bands }) {
     for (let i = 0; i < coords.length; i += 2) {
       coords[i] = gridX0 + coords[i] * gridDX;
       coords[i + 1] = gridProjY(coords[i + 1]);
@@ -447,6 +355,10 @@ async function main() {
   let transform = d3.zoomIdentity;
   let cur = { tx: cpX.slice(), ty: cpY.slice(), ringScale: 0 };
   let anim = null;
+  let morphQueued = false;
+  let calculating = false;
+  let navigating = false;
+  let interactionReady = false;
   let frameRequested = false;
   let route = null;
   let wasStretched = false;
@@ -494,8 +406,12 @@ async function main() {
 
   function frame(now) {
     frameRequested = false;
+    if (morphQueued) {
+      morphQueued = false;
+      remorph();
+    }
     if (anim) {
-      const u = Math.min(1, (now - anim.start) / ANIM_MS);
+      const u = reducedMotion.matches ? 1 : Math.min(1, (now - anim.start) / ANIM_MS);
       const ease = d3.easeCubicInOut(u);
       for (let i = 0; i < cpCount; i++) {
         cur.tx[i] = anim.from.tx[i] + (anim.to.tx[i] - anim.from.tx[i]) * ease;
@@ -512,6 +428,13 @@ async function main() {
   }
 
   function transitionTo(target) {
+    if (reducedMotion.matches) {
+      anim = null;
+      cur = target;
+      applyWarp();
+      requestFrame();
+      return;
+    }
     anim = {
       from: { tx: cur.tx.slice(), ty: cur.ty.slice(), ringScale: cur.ringScale },
       to: target,
@@ -545,44 +468,90 @@ async function main() {
     // The size measured at the last resize: reading the canvas here would force a layout.
     const W = renderer.w || window.innerWidth || 1280;
     const H = renderer.h || window.innerHeight || 720;
-    const panelW = W > 760 ? 360 : 0;
+    const panelW = W > 760 ? 380 : 0;
+    const panelH = W <= 760 ? 106 : 0;
     const pad = 24;
     const bw = Math.max(bounds.x1 - bounds.x0, 1);
     const bh = Math.max(bounds.y1 - bounds.y0, 1);
-    const k = Math.max(0.4, Math.min(24, (W - panelW - pad * 2) / bw, (H - pad * 2) / bh));
+    const k = Math.max(0.2, Math.min(24, (W - panelW - pad * 2) / bw, (H - panelH - pad * 2) / bh));
     const tx = panelW + (W - panelW - bw * k) / 2 - bounds.x0 * k;
-    const ty = (H - bh * k) / 2 - bounds.y0 * k;
+    const ty = panelH + (H - panelH - bh * k) / 2 - bounds.y0 * k;
     return d3.zoomIdentity.translate(tx, ty).scale(k);
   }
 
   // The view keeps re-fitting to the window until the user pans or zooms by hand.
   let autoFit = true;
-  const zoom = d3.zoom().scaleExtent([0.4, 24]).clickDistance(5).on('zoom', (ev) => {
+  const zoom = d3.zoom().scaleExtent([0.2, 24]).duration(reducedMotion.matches ? 0 : 250).clickDistance(5).on('start', (ev) => {
+    if (!interactionReady) return;
+    navigating = true;
+    clearHover();
+    canvas.style.cursor = 'grabbing';
+  }).on('end', () => {
+    navigating = false;
+    canvas.style.cursor = 'crosshair';
+    if (interactionReady && pointerInside && !pointerQueued) {
+      pointerQueued = true;
+      requestAnimationFrame(handlePointer);
+    }
+  }).on('zoom', (ev) => {
     if (ev.sourceEvent) autoFit = false;
     transform = ev.transform;
     requestFrame();
   });
   const selection = d3.select(canvas).call(zoom);
-  $('zoomIn').onclick = () => { autoFit = false; selection.transition().duration(250).call(zoom.scaleBy, 1.6); };
-  $('zoomOut').onclick = () => { autoFit = false; selection.transition().duration(250).call(zoom.scaleBy, 1 / 1.6); };
-  $('zoomReset').onclick = () => { autoFit = true; selection.transition().duration(400).call(zoom.transform, fitTransform()); };
+  reducedMotion.addEventListener('change', () => zoom.duration(reducedMotion.matches ? 0 : 250));
+  $('zoomIn').onclick = () => { autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1.6); };
+  $('zoomOut').onclick = () => { autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1 / 1.6); };
+  $('zoomReset').onclick = () => { autoFit = true; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 400).call(zoom.transform, fitTransform()); };
 
   function resize() {
     renderer.resize();
     if (autoFit) selection.call(zoom.transform, fitTransform());
     requestFrame();
   }
-  window.addEventListener('resize', resize);
-  if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(canvas);
+  let resizeQueued = false;
+  const queueResize = () => {
+    if (resizeQueued) return;
+    resizeQueued = true;
+    requestAnimationFrame(() => { resizeQueued = false; resize(); });
+  };
+  window.addEventListener('resize', queueResize);
+  if (window.ResizeObserver) new ResizeObserver(queueResize).observe(canvas);
   resize();
 
   // ---------------------------------------------------------------- recompute
   const statsEl = $('stats');
 
-  // Runs start to finish in one task, so a click always lands on a fully drawn map. The whole
-  // recalculation takes a few hundredths of a second, short enough not to need progress reporting.
+  let fallbackCalculator;
+  const routing = new RoutingClient(
+    { transit: transitJson, grid: gridJson, nodes: nodes.map(({ lat, lon, kind, stop }) => ({ lat, lon, kind, stop })) },
+    (origin, enabled) => (fallbackCalculator ||= new Calculator(engine, nodes)).compute(origin, enabled),
+    applyCalculation,
+  );
+
   function recompute() {
-    compute();
+    calculating = true;
+    clearHover();
+    canvas.setAttribute('aria-busy', 'true');
+    $('mapStatus').hidden = false;
+    writeHash();
+    routing.request(state.origin, state.enabled);
+  }
+
+  function applyCalculation(output) {
+    lastResult = output.result;
+    times = output.times;
+    nodeByCar = output.nodeByCar;
+    surface = output.surface;
+    coverage = output.coverage;
+    lastTiming = output.timing;
+    bandsGeom = output.contours ? buildBands(output.contours) : null;
+    dataVersion++;
+    bandsVersion++;
+    calculating = false;
+    canvas.setAttribute('aria-busy', 'false');
+    $('mapStatus').hidden = true;
+    $('loading').classList.add('done');
     full = null;
     const target = withMorph();
     updateRoute();
@@ -591,12 +560,12 @@ async function main() {
     writeHash();
     if (state.morph > 0) {
       transitionTo(target);
-      if (autoFit) selection.transition().duration(ANIM_MS).ease(d3.easeCubicInOut).call(zoom.transform, fitTransform(boundsOf(target)));
+      if (autoFit) selection.interrupt().transition().duration(reducedMotion.matches ? 0 : ANIM_MS).ease(d3.easeCubicInOut).call(zoom.transform, fitTransform(boundsOf(target)));
     } else {
       cur = { tx: target.tx, ty: target.ty, ringScale: target.ringScale };
       anim = null;
       applyWarp();
-      if (autoFit) selection.call(zoom.transform, fitTransform(boundsOf(target)));
+      if (autoFit) selection.interrupt().call(zoom.transform, fitTransform(boundsOf(target)));
       draw();
     }
   }
@@ -611,13 +580,12 @@ async function main() {
     applyWarp();
     clearTimeout(hashTimer);
     hashTimer = setTimeout(writeHash, 250);
-    if (autoFit) selection.call(zoom.transform, fitTransform(boundsOf(target)));
-    draw();
+    if (autoFit) selection.interrupt().call(zoom.transform, fitTransform(boundsOf(target)));
   }
 
   function updateStats() {
     if (!times) {
-      statsEl.innerHTML = 'Nothing ticked: this is plain geography.';
+      statsEl.textContent = 'Choose a way to travel to see journey times.';
       return;
     }
     const finite = Array.from(times).filter(Number.isFinite).sort((a, b) => a - b);
@@ -634,6 +602,7 @@ async function main() {
     let best = -1;
     let bestD = maxPx * maxPx;
     for (let i = 0; i < N; i++) {
+      if (!state.showStations && nodes[i].kind === 'station' && i !== state.origin.node) continue;
       const dx = cur.tx[i] * k + tx - sx;
       const dy = cur.ty[i] * k + ty - sy;
       const d = dx * dx + dy * dy;
@@ -706,16 +675,18 @@ async function main() {
     let y = sy + 16;
     if (x + tipSize.w > window.innerWidth - 8) x = sx - tipSize.w - 12;
     if (y + tipSize.h > window.innerHeight - 8) y = sy - tipSize.h - 12;
-    tooltip.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    tooltip.style.transform = `translate(${Math.round(Math.max(8, x))}px, ${Math.round(Math.max(8, y))}px)`;
   }
 
   // Pointer moves arrive far faster than frames, so the hit test runs at most once per frame.
   let pointerX = 0;
   let pointerY = 0;
   let pointerQueued = false;
+  let pointerInside = false;
 
   function handlePointer() {
     pointerQueued = false;
+    if (!pointerInside || navigating || calculating || anim || morphQueued) return;
     const i = nearestNode(pointerX, pointerY, 12);
     if (i !== state.hover) {
       state.hover = i;
@@ -735,20 +706,24 @@ async function main() {
     canvas.style.cursor = i >= 0 ? 'pointer' : 'crosshair';
   }
 
-  canvas.addEventListener('mousemove', (ev) => {
+  canvas.addEventListener('pointermove', (ev) => {
+    if (ev.pointerType === 'touch' || ev.buttons) return;
+    pointerInside = true;
     pointerX = ev.clientX;
     pointerY = ev.clientY;
     if (pointerQueued) return;
     pointerQueued = true;
     requestAnimationFrame(handlePointer);
   });
-  canvas.addEventListener('mouseleave', () => {
+  function clearHover() {
+    pointerInside = false;
     state.hover = -1;
     updateRoute();
     tooltip.hidden = true;
     tipFor = -1;
     requestFrame();
-  });
+  }
+  canvas.addEventListener('pointerleave', clearHover);
   // The hovered place is drawn into the cached layer, so its tooltip must be refreshed too.
   function invalidateTooltip() {
     tipFor = -2;
@@ -769,10 +744,11 @@ async function main() {
   }
 
   function setOrigin(origin) {
+    searchController?.reset();
     state.origin = snapOrigin(origin);
     originBase = proj(state.origin.lon, state.origin.lat);
     $('originName').textContent = state.origin.name;
-    $('search').value = '';
+    if (smallScreen.matches) setCollapsed(true);
     recompute();
   }
 
@@ -796,11 +772,18 @@ async function main() {
   });
 
   // ---------------------------------------------------------------- panel
+  const modeIcons = {
+    foot: '<circle cx="14" cy="4" r="2"/><path d="m7 21 3-7m6 7-2-7-3-3 1-4m-6 6 3-5 3-1 3 5 4 1"/>',
+    underground: '<circle cx="12" cy="12" r="8"/><path d="M2 9h20v6H2z"/>',
+    trains: '<rect x="5" y="3" width="14" height="15" rx="4"/><path d="M5 11h14M12 3v8m-5 11 3-4m7 4-3-4M8 15h1m6 0h1"/>',
+    bus: '<rect x="4" y="3" width="16" height="16" rx="3"/><path d="M4 11h16M8 15h1m6 0h1M7 19v2m10-2v2"/>',
+    car: '<path d="m5 8 2-4h10l2 4 2 3v7H3v-7zm-2 3h18M6 15h2m8 0h2M6 18v3m12-3v3"/>',
+  };
   const modesEl = $('modes');
   for (const m of MODES) {
     const label = document.createElement('label');
     label.className = `mode${state.enabled[m.id] ? ' on' : ''}`;
-    label.innerHTML = `<input type="checkbox" ${state.enabled[m.id] ? 'checked' : ''}><span class="icon">${m.icon}</span><span class="text"><span class="label">${m.label}</span><span class="sub">${m.hint}</span></span>`;
+    label.innerHTML = `<input type="checkbox" ${state.enabled[m.id] ? 'checked' : ''}><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24">${modeIcons[m.id]}</svg></span><span class="text"><span class="label">${m.label}</span><span class="sub">${m.hint}</span></span>`;
     const input = label.querySelector('input');
     input.addEventListener('change', () => {
       state.enabled[m.id] = input.checked;
@@ -821,65 +804,51 @@ async function main() {
   morphInput.addEventListener('input', () => {
     state.morph = +morphInput.value / 100;
     $('morphValue').textContent = `${morphInput.value}%`;
-    remorph();
+    clearHover();
+    morphQueued = true;
+    requestFrame();
   });
   if (state.morph > 0) $('more').open = true;
 
   const setFlag = (key, value) => {
     state[key] = value;
     styleVersion++;
-    draw();
+    if (key === 'showStations') clearHover();
+    requestFrame();
   };
   $('ghost').addEventListener('change', (ev) => setFlag('ghost', ev.target.checked));
   $('stations').addEventListener('change', (ev) => setFlag('showStations', ev.target.checked));
   $('busnet').addEventListener('change', (ev) => setFlag('showBus', ev.target.checked));
-  $('collapse').addEventListener('click', () => {
-    const panel = $('panel');
-    panel.classList.toggle('collapsed');
-    $('collapse').textContent = panel.classList.contains('collapsed') ? '+' : '−';
+  function setCollapsed(collapsed) {
+    if (collapsed && $('panelBody').contains(document.activeElement)) $('collapse').focus();
+    $('panel').classList.toggle('collapsed', collapsed);
+    $('panelBody').inert = collapsed;
+    $('collapse').setAttribute('aria-expanded', String(!collapsed));
+    $('collapse').setAttribute('aria-label', collapsed ? 'Expand controls' : 'Collapse controls');
+    $('collapse').title = collapsed ? 'Expand controls' : 'Collapse controls';
+  }
+  setCollapsed(smallScreen.matches);
+  smallScreen.addEventListener('change', (event) => setCollapsed(event.matches));
+  $('collapse').addEventListener('click', () => setCollapsed(!$('panel').classList.contains('collapsed')));
+
+  const searchController = installSearch(nodes, {
+    onSelect: setOrigin,
+    contains: (lon, lat) => grid.cellOf(lon, lat) >= 0,
   });
 
-  // Search box: every distinct station and place name, or a postcode.
-  const list = $('placeList');
-  const byName = new Map();
-  for (const node of nodes) if (!byName.has(node.name.toLowerCase())) byName.set(node.name.toLowerCase(), node);
-  const collator = new Intl.Collator();
-  const options = document.createDocumentFragment();
-  for (const node of [...byName.values()].sort((a, b) => collator.compare(a.name, b.name))) {
-    const opt = document.createElement('option');
-    opt.value = node.name;
-    options.appendChild(opt);
-  }
-  list.appendChild(options);
-  const search = $('search');
-  let searching = false;
-  const applySearch = async () => {
-    const text = search.value.trim();
-    if (!text || searching) return;
-    const node = byName.get(text.toLowerCase());
-    if (node) {
-      setOrigin({ lat: node.lat, lon: node.lon, name: node.name, node: node.index });
-      return;
-    }
-    const compact = text.replace(/\s+/g, '');
-    if (!POSTCODE_FULL.test(text) && !POSTCODE_OUTWARD.test(compact)) {
-      statsEl.innerHTML = `No place called “${text}”. Try a station, a landmark or a postcode.`;
-      return;
-    }
-    searching = true;
-    statsEl.innerHTML = `Looking up ${text.toUpperCase()}…`;
-    try {
-      const hit = await lookupPostcode(text);
-      if (!hit) statsEl.innerHTML = `Postcode ${text.toUpperCase()} not found.`;
-      else if (grid.cellOf(hit.lon, hit.lat) < 0) statsEl.innerHTML = `${hit.name} is outside the map.`;
-      else setOrigin({ lat: hit.lat, lon: hit.lon, name: hit.name, node: -1 });
-    } catch (err) {
-      statsEl.innerHTML = 'Postcode lookup failed. Check the connection and try again.';
-    }
-    searching = false;
-  };
-  search.addEventListener('change', applySearch);
-  search.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') applySearch(); });
+  // Keep keyboard navigation local to the focused map, leaving form controls alone.
+  canvas.addEventListener('keydown', (event) => {
+    const moves = { ArrowLeft: [80, 0], ArrowRight: [-80, 0], ArrowUp: [0, 80], ArrowDown: [0, -80] };
+    if (moves[event.key]) {
+      event.preventDefault();
+      autoFit = false;
+      clearHover();
+      const [dx, dy] = moves[event.key];
+      selection.interrupt().call(zoom.translateBy, dx / transform.k, dy / transform.k);
+    } else if (event.key === '+' || event.key === '=') { event.preventDefault(); $('zoomIn').click(); }
+    else if (event.key === '-') { event.preventDefault(); $('zoomOut').click(); }
+    else if (event.key === 'Home') { event.preventDefault(); $('zoomReset').click(); }
+  });
 
   // Line legend.
   const legend = $('legend');
@@ -902,6 +871,8 @@ async function main() {
     get transform() { return transform; },
     get cur() { return cur; },
     get timing() { return lastTiming; },
+    get calculating() { return calculating; },
+    get workerActive() { return !!routing.worker; },
     get renderStats() { return renderer.stats; },
     screenOf(i) { return [cur.tx[i] * transform.k + transform.x, cur.ty[i] * transform.k + transform.y]; },
     gridProject(gx, gy) { return [gridX0 + gx * gridDX, gridProjY(gy)]; },
@@ -919,13 +890,13 @@ async function main() {
   };
 
   // ---------------------------------------------------------------- go
-  // recompute() paints the first frame, in this same task.
+  interactionReady = true;
+  // Keep the loading screen until the first complete result is ready.
   state.origin = snapOrigin(state.origin);
   originBase = proj(state.origin.lon, state.origin.lat);
   $('originName').textContent = state.origin.name;
   cur = { tx: cpX.slice(), ty: cpY.slice(), ringScale: 0 };
   applyWarp();
-  $('loading').classList.add('done');
   recompute();
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => {
@@ -940,5 +911,11 @@ main().catch((err) => {
   console.error(err);
   const loading = $('loading');
   loading.classList.remove('done');
-  loading.innerHTML = `<span>Something went wrong: ${err.message}</span>`;
+  loading.replaceChildren();
+  const message = document.createElement('p');
+  message.textContent = 'London could not load. Check your connection and try again.';
+  const retry = document.createElement('button');
+  retry.textContent = 'Try again';
+  retry.onclick = () => location.reload();
+  loading.append(message, retry);
 });

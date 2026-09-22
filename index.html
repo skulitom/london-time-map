@@ -24,30 +24,38 @@
   <link rel="modulepreload" href="src/contours.js">
   <link rel="modulepreload" href="src/data.js">
   <link rel="modulepreload" href="src/warp.js">
+  <link rel="modulepreload" href="src/calculate.js">
+  <link rel="modulepreload" href="src/routing-client.js">
+  <link rel="modulepreload" href="src/search.js">
 </head>
 <body>
-  <canvas id="map" aria-label="Map of London coloured by travel time"></canvas>
+  <canvas id="map" tabindex="0" aria-label="Map of London coloured by travel time. Use arrow keys to pan, plus and minus to zoom, and Home to reset."></canvas>
 
   <aside class="panel" id="panel">
     <header class="panel-head">
-      <h1>London in minutes</h1>
-      <button class="collapse" id="collapse" aria-label="Collapse panel" title="Collapse">&#8722;</button>
+      <div class="brand"><span class="roundel" aria-hidden="true"></span><div><h1>London in minutes</h1><p>Explore the city in travel time</p></div></div>
+      <button class="collapse" id="collapse" aria-label="Collapse controls" aria-expanded="true" aria-controls="panelBody" title="Collapse controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 14 5-5 5 5"/></svg></button>
     </header>
-    <div class="panel-body">
-      <p class="lede">Colours show how long it takes to reach each part of London from <strong id="originName">Trafalgar Square</strong>. Tick the ways you are willing to travel.</p>
+    <p class="origin-line"><span class="origin-dot" aria-hidden="true"></span>From <strong id="originName">Trafalgar Square</strong></p>
+    <div class="panel-body" id="panelBody">
+      <form id="searchForm" class="search-form" role="search">
+        <label class="field-label" for="search">Starting point</label>
+        <div class="search-control">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>
+          <input id="search" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="searchResults" aria-describedby="searchStatus" placeholder="Station, place or postcode" autocomplete="off" spellcheck="false" enterkeyhint="search">
+          <button id="searchSubmit" type="submit" aria-label="Find starting point" title="Find starting point"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
+        </div>
+        <ul id="searchResults" class="search-results" role="listbox" aria-label="Suggested places" hidden></ul>
+        <p id="searchStatus" class="search-status" role="status" hidden></p>
+      </form>
 
-      <div class="modes" id="modes"></div>
+      <div class="field-label" id="travelLabel">Travel by</div>
+      <div class="modes" id="modes" role="group" aria-labelledby="travelLabel"></div>
 
-      <label class="field">
-        <span class="field-label">Start from</span>
-        <input id="search" list="placeList" placeholder="Station, place or postcode…" autocomplete="off" spellcheck="false">
-        <datalist id="placeList"></datalist>
-      </label>
-
-      <div class="field-label">Minutes from the start</div>
+      <div class="field-label">Journey time <span class="label-unit">minutes</span></div>
       <div class="bands" id="bands"></div>
 
-      <p class="stats" id="stats"></p>
+      <p class="stats" id="stats" role="status"></p>
 
       <div class="options">
         <label class="check"><input type="checkbox" id="stations" checked><span>Show stations</span></label>
@@ -55,7 +63,7 @@
       </div>
 
       <details class="more" id="more">
-        <summary>Stretch the map by time (experimental)</summary>
+        <summary>Stretch the map by time <span class="tag">Experimental</span></summary>
         <label class="field range">
           <span class="field-label">Stretch <output id="morphValue">0%</output></span>
           <input id="morph" type="range" min="0" max="100" value="0">
@@ -70,18 +78,19 @@
         <p>Walking runs on a 150 m grid where water blocks the way and only bridges and foot tunnels cross it. Tube, train, tram and bus rides follow the real TfL stop sequences with typical waits and speeds; driving uses daytime speeds that slow towards the centre, plus parking. With <em>By foot</em> unticked, walking is limited to 20 minutes to or from a stop. Times are estimates, not live journey plans.</p>
         <p class="credits">Data: <a href="https://tfl.gov.uk" target="_blank" rel="noopener">TfL</a>, <a href="https://geoportal.statistics.gov.uk" target="_blank" rel="noopener">ONS</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors. Postcodes via <a href="https://postcodes.io" target="_blank" rel="noopener">postcodes.io</a>.</p>
       </details>
-      <p class="hint">Click anywhere on the map to start from there. Hover a place for its route.</p>
+      <p class="hint"><span class="desktop-hint">Click the map to set a start. Hover a place for its route.</span><span class="touch-hint">Tap the map to set a start. Pinch to zoom.</span></p>
     </div>
   </aside>
 
   <div class="zoom">
     <button id="zoomIn" aria-label="Zoom in" title="Zoom in">+</button>
     <button id="zoomOut" aria-label="Zoom out" title="Zoom out">&#8722;</button>
-    <button id="zoomReset" aria-label="Reset view" title="Reset view">&#8982;</button>
+    <button id="zoomReset" aria-label="Reset view" title="Reset view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><circle cx="12" cy="12" r="3"/></svg></button>
   </div>
 
-  <div id="tooltip" class="tooltip" hidden></div>
-  <div id="loading" class="loading"><span>Loading London…</span></div>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+  <div id="mapStatus" class="map-status" role="status" hidden><span class="status-dot" aria-hidden="true"></span>Updating journey times…</div>
+  <div id="loading" class="loading" role="status"><div><span class="loading-roundel" aria-hidden="true"></span><strong>London in minutes</strong><span>Finding your way across the city…</span></div></div>
 
   <!-- Only the parts of D3 the map uses (projection, zoom with its transitions, Delaunay), in the
        versions D3 7.9.0 is built from: about half the size of the whole library. -->

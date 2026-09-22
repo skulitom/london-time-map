@@ -78,10 +78,12 @@ graphics card. These rules keep it cheap:
 - **Nothing is drawn twice.** Every input to the picture goes into one key; if the key matches the
   last frame, `draw()` returns without touching the canvas. An idle map runs no timers and repaints
   nothing.
-- **The map is a layer.** Land, colour bands, water, roads and the bus and rail networks are rendered
-  into an offscreen canvas that covers the window plus a margin. Panning copies it, moved by whole
-  pixels, and hovering redraws only the route, stations, places and labels on top of it. Zooming
-  scales the copy, and the layer is rendered sharp again once the zoom has been still for 150 ms.
+- **The map and labels are compositor layers.** Land, colour bands, water, roads and the bus and
+  rail networks are rendered into a padded canvas; stations, places and labels are cached in a
+  second canvas. Panning moves both using CSS transforms without copying the whole map or
+  rasterising its text each frame. A stationary transparent canvas receives input and draws only
+  the changing hover route. Zooming scales the layers, which are rendered sharp again once the
+  zoom has been still for 150 ms. Label collisions use a spatial grid to check nearby labels.
   Everything drawn over the colour bands is kept in a transparent overlay as well, so a new start
   point or tick box repaints only the land and the bands beneath it. A pan that runs past the margin
   moves the pixels the layer already has and renders only the strip it uncovered, and a fresh layer
@@ -95,9 +97,19 @@ graphics card. These rules keep it cheap:
 - **Paths are built once.** Geometry lives in base coordinates, with the bounding box of every ring
   and line, and whole `Path2D` objects are re-used under the canvas transform. Only the colour bands
   are rebuilt when the times change.
-- **Recalculation happens in one task.** Changing the start point or a tick box runs the search, the
-  surface and the contours start to finish and then paints, so the map is never left half-drawn, not
-  even in a window that is hidden or behind another one and therefore gets no animation frames.
+- **Recalculation runs in a worker.** Changing the start point or a tick box sends the search,
+  surface and contours to `src/routing-worker.js`, leaving the page free to respond. Only the
+  latest request is applied; rapid changes keep at most one active calculation and one pending
+  request. Typed buffers are transferred back and the result is displayed together. If a worker
+  cannot start, the same calculator runs locally as a fallback.
+- **Interactions share animation frames.** Slider and resize events are coalesced, hover routes
+  pause during navigation, and zoom controls interrupt an unfinished zoom instead of queuing it.
+  Reduced-motion preferences skip animated zoom and stretch transitions. The loading animation
+  stops once the first result is ready.
+
+The search supports keyboard suggestions (arrow keys, Enter and Escape) and cancels stale postcode
+lookups. Focus the map to pan with arrow keys, zoom with `+`/`-`, or reset with Home. On smaller
+screens, controls start collapsed so the map is visible; choosing a starting point closes them again.
 
 Driving times are only integrated where a car could actually win: the cheapest conceivable drive is
 the fixed overhead plus the straight line at top speed, and any place already reached sooner by
@@ -109,6 +121,15 @@ download alongside D3 instead of after it, and it loads only the parts of D3 the
 library. The bulk of `data/transit.json` and `data/base.json` (stops, platforms, hops and every
 coordinate) is stored as delta-encoded integers (`src/data.js`), which cuts the two from 718 KB to
 286 KB gzipped and makes them quicker to parse.
+
+### Verification
+
+Run `npm test` for calculation regression, request handling, worker fallback and label collisions.
+They use Node's built-in test runner and require no dependencies. The page itself still has no
+build step. For the browser regression checks (Node 20+), run `npm install` and `npx playwright install chromium`,
+start the local server, then run `npm run test:browser`. Set `TEST_URL` for a different server or
+`BROWSER_EXECUTABLE` to use an existing Chrome installation. These checks cover layer reuse while
+dragging and hovering, cache invalidation, long pans, zoom, stretch, resizing and idle rendering.
 
 ## Data
 
