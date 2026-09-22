@@ -338,6 +338,18 @@ export class Renderer {
     this.layer.className = 'map-layer';
     this.layer.setAttribute('aria-hidden', 'true');
     canvas.before(this.layer);
+    // A small, complete map fills newly exposed areas during zoom-out. The detailed layers can
+    // then stay on the compositor for the entire gesture, even beyond their padded extent.
+    this.preview = document.createElement('canvas');
+    this.preview.width = this.preview.height = 1;
+    this.preview.className = 'map-preview';
+    this.preview.setAttribute('aria-hidden', 'true');
+    this.preview.hidden = true;
+    this.layer.before(this.preview);
+    this.previewCtx = this.preview.getContext('2d', { alpha: false });
+    this.previewOverlay = document.createElement('canvas');
+    this.previewKey = null;
+    this.previewHeld = null;
     this.features = document.createElement('canvas');
     this.features.width = this.features.height = 1;
     this.featuresCtx = this.features.getContext('2d');
@@ -496,7 +508,7 @@ export class Renderer {
       scene.geomVersion, scene.bandsVersion, scene.dataVersion, scene.styleVersion,
       this.w, this.h, this.dpr,
       scene.transform.k, scene.transform.x, scene.transform.y,
-      scene.hover, scene.origin.x, scene.origin.y, scene.origin.name,
+      scene.hover, scene.origin.x, scene.origin.y, scene.origin.name, scene.navigating,
     ].join('|');
     if (key === this.frameKey) {
       this.stats.skipped++;
@@ -506,11 +518,15 @@ export class Renderer {
     this.ensurePaths(scene);
     this.render(scene);
     this.frameKey = key;
+    if (this.previewKey !== this.previewKeyFor(scene)) {
+      if (!scene.navigating && performance.now() - Math.max(this.movedAt, this.reshapedAt) >= SETTLE_MS) this.renderPreview(scene);
+      else this.settleSoon();
+    }
     // Part of the map layer's margin is still to render: carry on next frame, or, while the map is
     // being stretched and each frame lays out a new layer anyway, once it stops.
     if (this.held && this.held.pending.length) {
       this.frameKey = null;
-      if (performance.now() - this.reshapedAt < SETTLE_MS) this.settleSoon();
+      if (scene.navigating || performance.now() - Math.max(this.reshapedAt, this.movedAt) < SETTLE_MS) this.settleSoon();
       else this.onSettle();
     }
     this.stats.drawMs = performance.now() - t0;
@@ -568,6 +584,11 @@ export class Renderer {
       this.featureKey = key;
     }
     this.positionLayer(this.features, held, place);
+    // A long wheel/pinch gesture can cross several zoom levels before settling. Fade the cached
+    // labels before they become enormous or unreadably small; fresh labels return at their real size.
+    const opacity = Math.min(1, Math.max(0, (place.scale - 0.5) / 0.3))
+      * Math.min(1, Math.max(0, (2.5 - place.scale) / 0.75));
+    this.features.style.opacity = `${opacity}`;
   }
 
   renderFeatures(scene) {
@@ -627,6 +648,37 @@ export class Renderer {
     ].join('|');
   }
 
+  previewKeyFor(scene) {
+    return `${this.bandsKey(scene)}|${this.overlayKey(scene)}`;
+  }
+
+  // Render this fallback only at rest, at one device pixel per CSS pixel and at most 1024px
+  // along its longest side. It carries geography, not labels, so zoom-out never duplicates text.
+  renderPreview(scene) {
+    const b = this.bounds;
+    const pad = 48;
+    const k = Math.min(1, (1024 - 2 * pad) / Math.max(b.x1 - b.x0, b.y1 - b.y0, 1));
+    const pw = Math.ceil((b.x1 - b.x0) * k + 2 * pad);
+    const ph = Math.ceil((b.y1 - b.y0) * k + 2 * pad);
+    const held = { k, x: pad - b.x0 * k, y: pad - b.y0 * k, left: 0, top: 0, pw, ph };
+    const saved = { held: this.held, dpr: this.dpr, layerCtx: this.layerCtx, overlay: this.overlay, overlayCtx: this.overlayCtx };
+    const key = this.previewKeyFor(scene);
+    try {
+      this.preview.width = this.previewOverlay.width = pw;
+      this.preview.height = this.previewOverlay.height = ph;
+      this.preview.style.width = `${pw}px`;
+      this.preview.style.height = `${ph}px`;
+      this.held = held;
+      this.dpr = 1;
+      this.layerCtx = this.previewCtx;
+      this.overlay = this.previewOverlay;
+      this.overlayCtx = this.previewOverlay.getContext('2d');
+      this.renderPart(scene, 0, 0, pw, ph);
+      this.previewHeld = held;
+      this.previewKey = key;
+    } finally { Object.assign(this, saved); }
+  }
+
   // Positions the map's compositor layer, rendering it first if the held pixels cannot cover the
   // view, and returns the transform shared by the labels and interaction overlay.
   placeLayer(scene, now) {
@@ -646,10 +698,19 @@ export class Renderer {
       place = { scale: 1, left: held.left, top: held.top, k, x, y };
     } else if (held.bandsKey !== bandsKey) {
       this.paintBands(scene, bandsKey);
-    } else if (held.pending.length && now - this.reshapedAt >= SETTLE_MS) {
+    } else if (held.pending.length && !scene.navigating && now - Math.max(this.reshapedAt, this.movedAt) >= SETTLE_MS) {
       this.renderPending(scene);
     }
 
+    this.preview.hidden = place.scale === 1 || this.previewKey !== this.previewKeyFor(scene);
+    // Blend into the complete map on large zoom-outs instead of leaving a visible rectangle of
+    // tiny, sharper detail in its centre. All pixels stay aligned to the same geographic transform.
+    this.layer.style.opacity = this.preview.hidden ? '1' : `${Math.min(1, Math.max(0, (place.scale - 0.6) / 0.25))}`;
+    if (!this.preview.hidden) {
+      const p = this.previewHeld;
+      const scale = k / p.k;
+      this.preview.style.transform = `translate3d(${x - p.x * scale}px, ${y - p.y * scale}px, 0) scale(${scale})`;
+    }
     this.positionLayer(this.layer, held, place);
     return place;
   }
@@ -675,7 +736,8 @@ export class Renderer {
     // Zooming: scale the layer for now, and render it sharp once the zoom rests.
     const scale = k / held.k;
     const place = { scale, left: (held.left - held.x) * scale + x, top: (held.top - held.y) * scale + y, k, x, y };
-    if (scale < 0.5 || scale > 2 || !this.showable(held, place, scene)) return null;
+    // The overview fills outside the cached detail; avoid any rasterisation while zoom is active.
+    if (this.previewKey !== this.previewKeyFor(scene) && (scale < 0.5 || scale > 2 || !this.showable(held, place, scene))) return null;
     this.settleSoon();
     return place;
   }

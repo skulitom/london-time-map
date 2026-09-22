@@ -83,11 +83,17 @@ graphics card. These rules keep it cheap:
   second canvas. Panning moves both using CSS transforms without copying the whole map or
   rasterising its text each frame. A stationary transparent canvas receives input and draws only
   the changing hover route. Zooming scales the layers, which are rendered sharp again once the
-  zoom has been still for 150 ms. Label collisions use a spatial grid to check nearby labels.
+  zoom has been still for 150 ms. A complete, low-resolution background map is prepared while idle
+  to fill newly exposed areas during zoom-out, avoiding full redraws during the gesture. Labels fade
+  during large scale changes and return at their normal size when detail is restored.
+  Label collisions use a spatial grid to check nearby labels.
   Everything drawn over the colour bands is kept in a transparent overlay as well, so a new start
   point or tick box repaints only the land and the bands beneath it. A pan that runs past the margin
   moves the pixels the layer already has and renders only the strip it uncovered, and a fresh layer
   renders the part in the window first and its margin over the following frames.
+- **Gestures release reliably.** Mouse, pen and touch use pointer capture, with cleanup for lost
+  capture, cancellation, window blur, hidden tabs and missed button releases. Pinch zoom can continue
+  as a one-finger pan without a jump. A completed drag or pinch never changes the starting point.
 - **Paths stay small.** Chrome rasterises a stroked path that spans the screen many times more slowly
   than the same lines cut into pieces a hundred or so pixels across, so the bus network and the roads
   are drawn in chunks sized to the zoom level and chunks out of view are skipped. National Rail
@@ -129,7 +135,8 @@ They use Node's built-in test runner and require no dependencies. The page itsel
 build step. For the browser regression checks (Node 20+), run `npm install` and `npx playwright install chromium`,
 start the local server, then run `npm run test:browser`. Set `TEST_URL` for a different server or
 `BROWSER_EXECUTABLE` to use an existing Chrome installation. These checks cover layer reuse while
-dragging and hovering, cache invalidation, long pans, zoom, stretch, resizing and idle rendering.
+dragging and hovering, interrupted releases, touch pinch/pan/tap, cache invalidation, long pans,
+continuous zoom, stretch, resizing and idle rendering.
 
 ## Data
 

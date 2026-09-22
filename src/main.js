@@ -7,6 +7,7 @@ import { Renderer, COLOURS, blend } from './render.js';
 import { Calculator } from './calculate.js';
 import { RoutingClient } from './routing-client.js';
 import { installSearch } from './search.js';
+import { installNavigation } from './navigation.js';
 import { unpackTransit, unpackRuns } from './data.js';
 import { MODES, BANDS, UNREACHABLE_COLOUR } from './model.js';
 
@@ -394,7 +395,7 @@ async function main() {
       origin: { x: originBase[0], y: originBase[1], name: state.origin.name, node: state.origin.node },
       ringScale: cur.ringScale, morph: state.morph,
       hover: state.hover, route, ghost: state.ghost && state.morph > 0, showStations: state.showStations,
-      geomVersion, bandsVersion, dataVersion, styleVersion,
+      geomVersion, bandsVersion, dataVersion, styleVersion, navigating,
     });
   }
 
@@ -481,28 +482,53 @@ async function main() {
 
   // The view keeps re-fitting to the window until the user pans or zooms by hand.
   let autoFit = true;
-  const zoom = d3.zoom().scaleExtent([0.2, 24]).duration(reducedMotion.matches ? 0 : 250).clickDistance(5).on('start', (ev) => {
+  let navigation;
+  let zoomActive = false;
+  function startNavigation() {
     if (!interactionReady) return;
     navigating = true;
     clearHover();
     canvas.style.cursor = 'grabbing';
-  }).on('end', () => {
-    navigating = false;
+  }
+  function endNavigation() {
+    navigating = zoomActive || !!navigation?.active;
+    if (navigating) return;
     canvas.style.cursor = 'crosshair';
+    requestFrame();
     if (interactionReady && pointerInside && !pointerQueued) {
       pointerQueued = true;
       requestAnimationFrame(handlePointer);
     }
+  }
+  const zoom = d3.zoom().scaleExtent([0.2, 24]).duration(reducedMotion.matches ? 0 : 250)
+    .filter((event) => !navigation?.active && (!event.ctrlKey || event.type === 'wheel') && !event.button)
+    .on('start', () => {
+      zoomActive = true;
+      startNavigation();
+  }).on('end', () => {
+    zoomActive = false;
+    endNavigation();
   }).on('zoom', (ev) => {
     if (ev.sourceEvent) autoFit = false;
     transform = ev.transform;
     requestFrame();
   });
-  const selection = d3.select(canvas).call(zoom);
+  // Keep D3's wheel, double-click and animated zoom; use captured pointers for mouse, pen and touch.
+  const selection = d3.select(canvas).call(zoom)
+    .on('mousedown.zoom touchstart.zoom touchmove.zoom touchend.zoom touchcancel.zoom', null);
+  navigation = installNavigation(canvas, {
+    getTransform: () => transform,
+    setTransform: ({ k, x, y }) => {
+      autoFit = false;
+      selection.call(zoom.transform, d3.zoomIdentity.translate(x, y).scale(k));
+    },
+    start: () => { selection.interrupt(); startNavigation(); },
+    end: endNavigation,
+  });
   reducedMotion.addEventListener('change', () => zoom.duration(reducedMotion.matches ? 0 : 250));
-  $('zoomIn').onclick = () => { autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1.6); };
-  $('zoomOut').onclick = () => { autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1 / 1.6); };
-  $('zoomReset').onclick = () => { autoFit = true; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 400).call(zoom.transform, fitTransform()); };
+  $('zoomIn').onclick = () => { navigation.cancel(); autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1.6); };
+  $('zoomOut').onclick = () => { navigation.cancel(); autoFit = false; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 250).call(zoom.scaleBy, 1 / 1.6); };
+  $('zoomReset').onclick = () => { navigation.cancel(); autoFit = true; selection.interrupt().transition().duration(reducedMotion.matches ? 0 : 400).call(zoom.transform, fitTransform()); };
 
   function resize() {
     renderer.resize();
@@ -872,6 +898,7 @@ async function main() {
     get cur() { return cur; },
     get timing() { return lastTiming; },
     get calculating() { return calculating; },
+    get navigating() { return navigating; },
     get workerActive() { return !!routing.worker; },
     get renderStats() { return renderer.stats; },
     screenOf(i) { return [cur.tx[i] * transform.k + transform.x, cur.ty[i] * transform.k + transform.y]; },
